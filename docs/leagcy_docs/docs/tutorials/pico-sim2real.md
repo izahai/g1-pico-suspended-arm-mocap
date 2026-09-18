@@ -109,8 +109,8 @@ Starting the program does not immediately give Pico control of the robot.
 
 Labels beginning with **G1 remote** refer to the Unitree remote. Labels
 beginning with **Pico controller** refer to the VR controllers. In the
-interactive Teleopit terminal, **F** enters `SUSPENDED_ARMS` from `STANDING`
-and returns to `STANDING` on the next press.
+interactive Teleopit terminal, **1** selects `LEFT_SUSPENDED_ARMS`, **2**
+selects `RIGHT_SUSPENDED_ARMS`, and **3** selects `SUSPENDED_ARMS`.
 
 Press **G1 remote** `Start` to enter `STANDING`. Wait until the robot is stable,
 stand in a neutral pose and make sure Pico tracking is valid. Then press
@@ -121,15 +121,18 @@ stand in a neutral pose and make sure Pico tracking is valid. Then press
 standing pose while both arms continue to follow. `PAUSED` holds the current
 reference; resuming returns to the previous active mode.
 
-`SUSPENDED_ARMS` uses the same live arm reference as `ARMS`, but holds the legs
-and waist at their measured angles from entry with PD position control. The
-policy's non-arm outputs are not sent to those joints. Press **F** only from
-`STANDING`; entry waits up to two seconds for valid Pico frames, then cancels
-if none arrive. Press **F** again after tracking recovers. While active, Pico
-controller `B` switches to regular `ARMS`, restoring full-body policy output.
-G1 remote `B` or Pico controller `A` pauses and resumes arm tracking. G1 remote
-`X` returns to `STANDING`, where normal full-body policy output resumes.
-`SUSPENDED_ARMS` cannot be recorded; entering it discards an active episode.
+The three suspended arm modes use the same live arm reference as `ARMS`.
+Only the selected arm joints receive policy targets: left joints 15–21, right
+joints 22–28, or both arms 15–28. The other joints hold measured angles under
+PD position control. Enter from `IDLE` when the robot is suspended or from
+`STANDING`. Entry waits up to two seconds for valid Pico frames and cancels if
+none arrive; press a number again after tracking recovers. Switch directly
+among **1**, **2**, and **3**. An arm that becomes inactive holds its measured
+angle, while the legs and waist retain their entry targets. Press the active
+number again or G1 remote `X` to return to the origin mode. Pico controller
+`B` switches the both-arm mode to regular `ARMS` and is ignored in single-arm
+modes. G1 remote `B` or Pico controller `A` pauses and resumes tracking.
+Suspended arm modes cannot be recorded; entering one discards an active episode.
 
 Teleopit checks several consecutive Pico frames before entering `MOCAP`. If
 that check fails, the robot stays in `STANDING`.

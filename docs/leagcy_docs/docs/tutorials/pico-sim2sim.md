@@ -92,12 +92,16 @@ simulation from any state.
 standing pose while both arms continue to follow. `PAUSED` holds the current
 reference and returns to the previous active mode when resumed.
 
-Keyboard `F` from `STANDING` enters `SUSPENDED_ARMS`; pressing `F` again returns
-to `STANDING`. This mode tracks the arms while holding the legs and waist at
-their measured entry angles with PD position control. It ignores the policy's
-non-arm outputs. Pico controller or keyboard `B` switches it to regular `ARMS`,
-which restores policy output for all joints. If Pico tracking is unavailable,
-`F` leaves the simulation in `STANDING`; press it again after tracking recovers.
+Keyboard `1` selects `LEFT_SUSPENDED_ARMS`, `2` selects
+`RIGHT_SUSPENDED_ARMS`, and `3` selects `SUSPENDED_ARMS` (both arms).
+Enter from `IDLE` or `STANDING`, switch directly among the three modes, and
+press the active number again or `X` to return to the origin mode. Only the
+selected arm joints receive policy targets. The other joints hold measured
+angles with PD position control; an arm that becomes inactive captures its
+current angle while the legs and waist retain their original targets. Pico
+controller or keyboard `B` switches the both-arm mode to regular `ARMS` and
+is ignored in single-arm modes. If Pico tracking is unavailable, press the
+number again after tracking recovers.
 
 Each new `STANDING -> MOCAP` session recalibrates the live root pose. You may
 turn to a new heading while standing, then enter `MOCAP` again.

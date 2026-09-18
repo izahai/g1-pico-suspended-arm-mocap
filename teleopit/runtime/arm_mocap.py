@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -8,8 +7,6 @@ from numpy.typing import NDArray
 
 from teleopit.constants import ROOT_DIM
 from teleopit.runtime.common import cfg_get
-from teleopit.sim.reference_timeline import ReferenceSample, ReferenceWindow
-
 if TYPE_CHECKING:
     from teleopit.sim.reference_timeline import ReferenceSample, ReferenceWindow
 

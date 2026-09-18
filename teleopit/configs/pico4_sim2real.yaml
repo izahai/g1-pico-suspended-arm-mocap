@@ -119,7 +119,7 @@ neck:
   port: null
   rate_hz: 60.0
   frame_timeout_s: 0.2
-  active_modes: [standing, mocap, arms, suspended_arms, pause]
+  active_modes: [standing, mocap, arms, suspended_arms, left_suspended_arms, right_suspended_arms, pause]
   dead_zone_deg: 0.5
   pitch_gain: 1.4
   center_on_start: true

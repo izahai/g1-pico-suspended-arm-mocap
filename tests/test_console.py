@@ -19,7 +19,7 @@ def test_sim_console_shows_only_enabled_keyboard_controls() -> None:
 
     labels = [control.keys for control in sim_keyboard_controls(cfg)]
 
-    assert labels == ["Y", "A", "B", "F", "X", "Q"]
+    assert labels == ["Y", "A", "B", "1", "2", "3", "X", "Q"]
 
 
 def test_sim_console_hides_non_keyboard_controls() -> None:
@@ -45,6 +45,10 @@ def test_sim2real_console_shows_remote_and_pico_controls() -> None:
     assert "[Remote L1+R1] damping / estop" in rendered
     assert "[Pico/Controller A] pause/resume" in rendered
     assert "[Pico/Controller B] arms" in rendered
+    assert "[1] left suspended arm" in rendered
+    assert "[2] right suspended arm" in rendered
+    assert "[3] suspended arms" in rendered
+    assert "[F]" not in rendered
     assert "[H] help" not in rendered
 
 

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
   <title id="title">Pico simulation control state machine</title>
-  <desc id="desc">Keyboard Y starts a live session, keyboard F toggles suspended arms from standing, keyboard or Pico controller B switches between whole-body and arms-only control, keyboard or Pico controller A pauses, keyboard X returns to standing, and keyboard Q quits.</desc>
+  <desc id="desc">Keyboard Y starts a live session. Keyboard 1 selects left suspended arm, 2 right suspended arm, and 3 both arms from standing or idle; pressing the active number again exits. Keyboard or Pico controller B switches whole-body and regular arms control, keyboard or Pico controller A pauses, keyboard X exits, and keyboard Q quits.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 Z" fill="#475569"/>
@@ -36,8 +36,8 @@
   <text x="181" y="291" class="state-copy" text-anchor="middle">Standing pose · tracking inactive</text>
 
   <rect x="62" y="414" width="238" height="100" rx="18" fill="#fae8ff" stroke="#a21caf" stroke-width="2.5"/>
-  <text x="181" y="452" class="state-title" text-anchor="middle" style="font-size:18px">SUSPENDED_ARMS</text>
-  <text x="181" y="482" class="state-copy" text-anchor="middle">Held legs · live arms</text>
+  <text x="181" y="452" class="state-title" text-anchor="middle" style="font-size:17px">SUSPENDED ARM MODES</text>
+  <text x="181" y="482" class="state-copy" text-anchor="middle">1 left · 2 right · 3 both</text>
 
   <rect x="430" y="158" width="230" height="98" rx="18" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
   <circle cx="459" cy="184" r="8" fill="#16a34a"/>
@@ -60,7 +60,8 @@
 
   <path d="M181 324 L181 414" class="both"/>
   <rect x="113" y="349" width="136" height="28" rx="14" fill="#dbeafe"/>
-  <text x="181" y="368" class="label" text-anchor="middle">Keyboard F</text>
+  <text x="181" y="368" class="label" text-anchor="middle">Keyboard 1/2/3</text>
+  <text x="181" y="544" class="state-copy" text-anchor="middle">Also enter directly from IDLE</text>
 
   <path d="M390 311 C354 311 337 292 300 292" class="arrow"/>
   <rect x="301" y="329" width="168" height="28" rx="14" fill="#dbeafe"/>

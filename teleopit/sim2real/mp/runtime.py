@@ -15,7 +15,14 @@ from typing import Any, Callable
 import numpy as np
 from numpy.typing import NDArray
 
-from teleopit.constants import FULL_QPOS_DIM, NUM_JOINTS, ROOT_DIM
+from teleopit.constants import (
+    BOTH_ARMS_JOINT_INDICES,
+    FULL_QPOS_DIM,
+    LEFT_ARM_JOINT_INDICES,
+    NUM_JOINTS,
+    RIGHT_ARM_JOINT_INDICES,
+    ROOT_DIM,
+)
 from teleopit.high_level_policy.client import PolicyActionChunk
 from teleopit.high_level_policy.config import (
     parse_high_level_policy_config,
@@ -148,6 +155,8 @@ class RobotMode(Enum):
     MOCAP = "mocap"
     ARMS = "arms"
     SUSPENDED_ARMS = "suspended_arms"
+    LEFT_SUSPENDED_ARMS = "left_suspended_arms"
+    RIGHT_SUSPENDED_ARMS = "right_suspended_arms"
     JOYSTICK = "joystick"
     POLICY = "policy"
     DAMPING = "damping"
@@ -595,15 +604,21 @@ class Sim2RealRuntime:
             if normalized == "h":
                 self._console.help(self._console_controls)
                 continue
-            command = (
-                "toggle_suspended_arms"
-                if normalized == "f" and _input_provider_kind(self.cfg) == "pico4"
-                else map_recording_key_to_command(event.key) if _recording_enabled(self.cfg) else None
-            )
+            if normalized == "1" and _input_provider_kind(self.cfg) == "pico4":
+                command = "toggle_left_suspended_arms"
+                label = "toggle left suspended arms"
+            elif normalized == "2" and _input_provider_kind(self.cfg) == "pico4":
+                command = "toggle_right_suspended_arms"
+                label = "toggle right suspended arms"
+            elif normalized == "3" and _input_provider_kind(self.cfg) == "pico4":
+                command = "toggle_suspended_arms"
+                label = "toggle suspended arms"
+            else:
+                command = map_recording_key_to_command(event.key) if _recording_enabled(self.cfg) else None
+                label = _recording_command_label(command) if command is not None else ""
             if command is None:
                 continue
             self._command_pub.publish(COMMAND_TOPIC, CommandPacket(command=command, timestamp_s=time.monotonic()))
-            label = "toggle suspended arms" if command == "toggle_suspended_arms" else _recording_command_label(command)
             self._console.key_feedback(str(event.key).upper(), label)
             if command == "shutdown":
                 self._stop_event.set()
@@ -1287,6 +1302,8 @@ class _RobotControlWorker:
         self._suspended_entry_deadline_s: float | None = None
         self._suspended_entry_from_idle = False
         self._suspended_hold_joint_pos: Float32Array | None = None
+        self._suspended_target_mode: RobotMode = RobotMode.SUSPENDED_ARMS
+        self._active_suspended_arm_indices: tuple[int, ...] = BOTH_ARMS_JOINT_INDICES
         self._mocap_reference_armed = False
         self._mocap_reference_arm_time_s: float | None = None
         self._mocap_reference_arm_retry_s = float(cfg_get(_mp_cfg(cfg), "mocap_reference_arm_retry_s", 0.1))
@@ -1432,7 +1449,13 @@ class _RobotControlWorker:
                     self._handle_transitions()
                     if self.mode == RobotMode.STANDING:
                         self._standing_step()
-                    elif self.mode in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS):
+                    elif self.mode in (
+                        RobotMode.MOCAP,
+                        RobotMode.ARMS,
+                        RobotMode.SUSPENDED_ARMS,
+                        RobotMode.LEFT_SUSPENDED_ARMS,
+                        RobotMode.RIGHT_SUSPENDED_ARMS,
+                    ):
                         self._mocap_step()
                     elif self.mode == RobotMode.JOYSTICK:
                         self._joystick_step()
@@ -1454,7 +1477,15 @@ class _RobotControlWorker:
     def shutdown(self) -> None:
         if self.high_level_policy_enabled and self._policy_session_id is not None:
             self._stop_high_level_policy_session()
-        if self.mode in (RobotMode.STANDING, RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS, RobotMode.POLICY):
+        if self.mode in (
+            RobotMode.STANDING,
+            RobotMode.MOCAP,
+            RobotMode.ARMS,
+            RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
+            RobotMode.POLICY,
+        ):
             try:
                 self.robot.set_damping()
                 time.sleep(0.5)
@@ -1503,20 +1534,25 @@ class _RobotControlWorker:
 
     def _drain_ipc(self) -> None:
         command = self._command_sub.recv_latest()
-        if isinstance(command, CommandPacket) and command.command == "shutdown":
-            self.stop_event.set()
-            return
-        if isinstance(command, CommandPacket) and command.command == "toggle_suspended_arms":
-            self._toggle_suspended_arms_mode()
-        if isinstance(command, CommandPacket) and command.command == HIGH_LEVEL_POLICY_FAULT_COMMAND:
-            detail = str(
-                command.payload.get(
-                    "detail",
-                    "required high-level-policy input worker exited",
+        if isinstance(command, CommandPacket):
+            if command.command == "shutdown":
+                self.stop_event.set()
+                return
+            if command.command == "toggle_suspended_arms":
+                self._toggle_suspended_arms_mode(RobotMode.SUSPENDED_ARMS)
+            elif command.command == "toggle_left_suspended_arms":
+                self._toggle_suspended_arms_mode(RobotMode.LEFT_SUSPENDED_ARMS)
+            elif command.command == "toggle_right_suspended_arms":
+                self._toggle_suspended_arms_mode(RobotMode.RIGHT_SUSPENDED_ARMS)
+            elif command.command == HIGH_LEVEL_POLICY_FAULT_COMMAND:
+                detail = str(
+                    command.payload.get(
+                        "detail",
+                        "required high-level-policy input worker exited",
+                    )
                 )
-            )
-            self._handle_high_level_policy_fault(detail)
-            return
+                self._handle_high_level_policy_fault(detail)
+                return
         if bool(getattr(self, "high_level_policy_enabled", False)):
             self._drain_high_level_policy_ipc()
             return
@@ -1548,8 +1584,9 @@ class _RobotControlWorker:
                     return
                 deadline_s = self._suspended_entry_deadline_s
                 if deadline_s is not None and time.monotonic() >= deadline_s:
+                    target_label = getattr(self, "_suspended_target_mode", RobotMode.SUSPENDED_ARMS).value.upper()
                     self._cancel_suspended_entry()
-                    operator_logger.warning("F -> Pico tracking not ready; remaining in IDLE")
+                    operator_logger.warning("Pico tracking not ready for %s; remaining in IDLE", target_label)
             if self.remote.start.on_pressed:
                 operator_logger.info("Start -> STANDING")
                 self._enter_standing()
@@ -1589,8 +1626,9 @@ class _RobotControlWorker:
                     return
                 deadline_s = self._suspended_entry_deadline_s
                 if deadline_s is not None and time.monotonic() >= deadline_s:
+                    target_label = getattr(self, "_suspended_target_mode", RobotMode.SUSPENDED_ARMS).value.upper()
                     self._cancel_suspended_entry()
-                    operator_logger.warning("F -> Pico tracking not ready; remaining in STANDING")
+                    operator_logger.warning("Pico tracking not ready for %s; remaining in STANDING", target_label)
             if self._mocap_entry_requested:
                 self._arm_mocap_reference_if_needed()
                 if self._can_switch_to_mocap():
@@ -1600,7 +1638,13 @@ class _RobotControlWorker:
                     operator_logger.warning(
                         "Y -> no body tracking data (wake the ankle trackers / check PicoBridge), holding STANDING"
                     )
-        elif self.mode in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS):
+        elif self.mode in (
+            RobotMode.MOCAP,
+            RobotMode.ARMS,
+            RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
+        ):
             if self.provider_kind == "bvh" and self.remote.B.on_pressed:
                 operator_logger.info("B -> replay BVH from frame 0")
                 self._send_reference_command("replay_mocap")
@@ -1621,7 +1665,14 @@ class _RobotControlWorker:
                     self._pause_active_mocap()
                 return
             if self.remote.X.on_pressed:
-                if self.mode == RobotMode.SUSPENDED_ARMS and getattr(self, "_suspended_entry_from_idle", False):
+                if (
+                    self.mode in (
+                        RobotMode.SUSPENDED_ARMS,
+                        RobotMode.LEFT_SUSPENDED_ARMS,
+                        RobotMode.RIGHT_SUSPENDED_ARMS,
+                    )
+                    and getattr(self, "_suspended_entry_from_idle", False)
+                ):
                     operator_logger.info("X -> IDLE")
                     self._enter_idle()
                 else:
@@ -2352,7 +2403,12 @@ class _RobotControlWorker:
             robot_state,
             reference_window=reference_window,
             align_reference=True,
-            compose_arms=self.mode in (RobotMode.ARMS, RobotMode.SUSPENDED_ARMS),
+            compose_arms=self.mode in (
+                RobotMode.ARMS,
+                RobotMode.SUSPENDED_ARMS,
+                RobotMode.LEFT_SUSPENDED_ARMS,
+                RobotMode.RIGHT_SUSPENDED_ARMS,
+            ),
         )
 
     def _execute_reference_pipeline(
@@ -2409,11 +2465,16 @@ class _RobotControlWorker:
         obs = self._ref_proc.validate_observation(obs)
         action = self.policy.compute_action(obs)
         target_dof_pos = self.policy.get_target_dof_pos(action)
-        if self.mode == RobotMode.SUSPENDED_ARMS:
+        if self.mode in (
+            RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
+        ):
             if self._suspended_hold_joint_pos is None:
-                raise RuntimeError("SUSPENDED_ARMS has no captured leg and waist positions")
+                raise RuntimeError(f"{self.mode.name} has no captured leg and waist positions")
+            active_indices = getattr(self, "_active_suspended_arm_indices", self._arm_joint_indices)
             action, target_dof_pos = hold_non_arm_joints(
-                action, target_dof_pos, self._suspended_hold_joint_pos, self._arm_joint_indices,
+                action, target_dof_pos, self._suspended_hold_joint_pos, active_indices,
             )
         target_dof_pos = self._safety.clip_to_joint_limits(target_dof_pos)
         self._safety.send_positions(target_dof_pos)
@@ -2454,6 +2515,8 @@ class _RobotControlWorker:
         self._suspended_entry_deadline_s = None
         self._suspended_hold_joint_pos = None
         self._suspended_entry_from_idle = False
+        self._suspended_target_mode = RobotMode.SUSPENDED_ARMS
+        self._active_suspended_arm_indices = BOTH_ARMS_JOINT_INDICES
         if prev_mode == RobotMode.STANDING:
             return
         already_in_debug = self.mode in (
@@ -2461,6 +2524,8 @@ class _RobotControlWorker:
             RobotMode.MOCAP,
             RobotMode.ARMS,
             RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
             RobotMode.POLICY,
         )
         if not already_in_debug:
@@ -2477,6 +2542,8 @@ class _RobotControlWorker:
             RobotMode.MOCAP,
             RobotMode.ARMS,
             RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
             RobotMode.POLICY,
         ):
             logger.info("Locking joints to current position...")
@@ -2494,6 +2561,8 @@ class _RobotControlWorker:
             RobotMode.MOCAP,
             RobotMode.ARMS,
             RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
             RobotMode.POLICY,
         ):
             self._safety.start_kp_ramp(
@@ -2552,35 +2621,88 @@ class _RobotControlWorker:
         self._mocap_entry_requested = False
         operator_logger.info("mode -> %s", entry_mode.value.upper())
 
-    def _toggle_suspended_arms_mode(self) -> None:
+    def _toggle_suspended_arms_mode(self, target_mode: RobotMode = RobotMode.SUSPENDED_ARMS) -> None:
         if self.provider_kind != "pico4" or self.high_level_policy_enabled:
             return
-        if self.mode == RobotMode.SUSPENDED_ARMS:
-            if getattr(self, "_suspended_entry_from_idle", False):
-                self._enter_idle()
-            else:
-                self._enter_standing()
+        if getattr(self, "_pending_after_settle", None) is not None:
+            operator_logger.info("Command ignored while waiting for joystick transition to settle")
             return
+
+        if target_mode == RobotMode.LEFT_SUSPENDED_ARMS:
+            active_indices = LEFT_ARM_JOINT_INDICES
+        elif target_mode == RobotMode.RIGHT_SUSPENDED_ARMS:
+            active_indices = RIGHT_ARM_JOINT_INDICES
+        else:
+            active_indices = BOTH_ARMS_JOINT_INDICES
+
+        suspended_modes = (
+            RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
+        )
+
+        if self.mode in suspended_modes:
+            if self.mode == target_mode:
+                if getattr(self, "_suspended_entry_from_idle", False):
+                    self._enter_idle()
+                else:
+                    self._enter_standing()
+                return
+
+            # Switching directly between suspended arm modes on the fly
+            state = self.robot.get_state()
+            held = np.asarray(getattr(state, "qpos"), dtype=np.float32).reshape(-1)
+            if held.shape[0] < self.num_actions:
+                raise ValueError(f"Robot state has {held.shape[0]} joints; need {self.num_actions}")
+            if not np.all(np.isfinite(held[: self.num_actions])):
+                raise ValueError(f"Robot state has non-finite joint positions when switching to {target_mode.value.upper()}")
+
+            if self._suspended_hold_joint_pos is None:
+                raise RuntimeError("Suspended arm mode has no captured joint positions")
+            new_hold = self._suspended_hold_joint_pos.copy()
+            newly_inactive = tuple(set(self._active_suspended_arm_indices) - set(active_indices))
+            safe_held = self._safety.clip_to_joint_limits(held[: self.num_actions])
+            if np.any(np.abs(safe_held[list(newly_inactive)] - held[list(newly_inactive)]) > 1e-4):
+                operator_logger.warning("Newly inactive arm is outside configured joint limits; switch ignored")
+                return
+            new_hold[list(newly_inactive)] = held[list(newly_inactive)]
+
+            self._suspended_hold_joint_pos = new_hold
+            self._active_suspended_arm_indices = active_indices
+            self.mode = target_mode
+            operator_logger.info("mode -> %s", target_mode.value.upper())
+            return
+
         if self.mode not in (RobotMode.STANDING, RobotMode.IDLE):
             operator_logger.info(
-                "F ignored in %s; enter SUSPENDED_ARMS from STANDING or IDLE",
+                "Command ignored in %s; enter suspended arms from STANDING or IDLE",
                 self.mode.value.upper(),
             )
             return
-        if getattr(self, "_pending_after_settle", None) is not None:
-            operator_logger.info("F ignored while waiting for joystick transition to settle")
-            return
+
         if self._suspended_entry_requested:
-            self._cancel_suspended_entry()
-            operator_logger.info("F -> suspended arms entry cancelled")
+            if getattr(self, "_suspended_target_mode", RobotMode.SUSPENDED_ARMS) == target_mode:
+                self._cancel_suspended_entry()
+                operator_logger.info("%s entry cancelled", target_mode.value.upper())
+                return
+            # Switch target mode while still validating
+            self._suspended_target_mode = target_mode
+            operator_logger.info(
+                "validating Pico tracking for %s (%s origin)",
+                target_mode.value.upper(),
+                "IDLE" if self._suspended_entry_from_idle else "STANDING",
+            )
             return
+
         self._mocap_entry_requested = False
         self._suspended_entry_requested = True
+        self._suspended_target_mode = target_mode
         self._suspended_entry_from_idle = (self.mode == RobotMode.IDLE)
         self._suspended_entry_deadline_s = time.monotonic() + 2.0
         self._arm_mocap_reference_if_needed()
         operator_logger.info(
-            "F -> validating Pico tracking for SUSPENDED_ARMS (%s origin)",
+            "validating Pico tracking for %s (%s origin)",
+            target_mode.value.upper(),
             "IDLE" if self._suspended_entry_from_idle else "STANDING",
         )
 
@@ -2588,6 +2710,7 @@ class _RobotControlWorker:
         self._suspended_entry_requested = False
         self._suspended_entry_deadline_s = None
         self._suspended_entry_from_idle = False
+        self._suspended_target_mode = RobotMode.SUSPENDED_ARMS
         if not self._mocap_entry_requested:
             self._disarm_mocap_reference_if_needed()
             self._clear_reference_gate()
@@ -2600,6 +2723,8 @@ class _RobotControlWorker:
         self._suspended_entry_deadline_s = None
         self._suspended_hold_joint_pos = None
         self._suspended_entry_from_idle = False
+        self._suspended_target_mode = RobotMode.SUSPENDED_ARMS
+        self._active_suspended_arm_indices = BOTH_ARMS_JOINT_INDICES
         logger.info("Exiting debug mode (returning to IDLE)...")
         self.robot.exit_debug_mode()
         self.mode = RobotMode.IDLE
@@ -2610,6 +2735,14 @@ class _RobotControlWorker:
         operator_logger.info("mode -> IDLE")
 
     def _transition_to_suspended_arms(self) -> None:
+        target_mode = getattr(self, "_suspended_target_mode", RobotMode.SUSPENDED_ARMS)
+        if target_mode == RobotMode.LEFT_SUSPENDED_ARMS:
+            active_indices = LEFT_ARM_JOINT_INDICES
+        elif target_mode == RobotMode.RIGHT_SUSPENDED_ARMS:
+            active_indices = RIGHT_ARM_JOINT_INDICES
+        else:
+            active_indices = BOTH_ARMS_JOINT_INDICES
+
         from_idle = self.mode == RobotMode.IDLE
         if from_idle:
             logger.info("Entering debug mode (suspended arms from IDLE)...")
@@ -2628,32 +2761,35 @@ class _RobotControlWorker:
         if held.shape[0] < self.num_actions:
             raise ValueError(f"Robot state has {held.shape[0]} joints; need {self.num_actions}")
         if not np.all(np.isfinite(held[: self.num_actions])):
-            raise ValueError("Robot state has non-finite joint positions on SUSPENDED_ARMS entry")
+            raise ValueError(f"Robot state has non-finite joint positions on {target_mode.value.upper()} entry")
         non_arm_mask = np.ones(self.num_actions, dtype=bool)
-        non_arm_mask[self._arm_joint_indices] = False
+        valid_indices = [int(i) for i in active_indices if 0 <= i < self.num_actions]
+        if valid_indices:
+            non_arm_mask[valid_indices] = False
         safe_held = self._safety.clip_to_joint_limits(held[: self.num_actions])
         if np.any(np.abs(safe_held[non_arm_mask] - held[: self.num_actions][non_arm_mask]) > 1e-4):
             self._cancel_suspended_entry()
             if from_idle:
                 self.robot.exit_debug_mode()
-                operator_logger.warning("F -> non-arm joint outside configured limits; remaining in IDLE")
+                operator_logger.warning("Non-arm joint outside configured limits; remaining in IDLE")
             else:
-                operator_logger.warning("F -> non-arm joint outside configured limits; remaining in STANDING")
+                operator_logger.warning("Non-arm joint outside configured limits; remaining in STANDING")
             return
         self._suspended_hold_joint_pos = held[: self.num_actions].copy()
+        self._active_suspended_arm_indices = active_indices
         if from_idle:
             init_qpos = self._build_robot_state_qpos(state)
             self._last_retarget_qpos = init_qpos
             self._ref_proc.last_reference_qpos = None
             self._mocap_session.reset()
             self._last_commanded_motion_qpos = None
-        self._transition_to_mocap(entry_mode=RobotMode.SUSPENDED_ARMS, entry_state=state)
+        self._transition_to_mocap(entry_mode=target_mode, entry_state=state)
         self._set_default_standing_reference(state)
         if from_idle:
             self._safety.start_kp_ramp()
         self._suspended_entry_requested = False
         self._suspended_entry_deadline_s = None
-        operator_logger.info("SUSPENDED_ARMS holds legs and waist at measured entry angles")
+        operator_logger.info("%s holds non-controlled joints at measured entry angles", target_mode.value.upper())
 
     def _toggle_arms_mode(self) -> None:
         if self.provider_kind != "pico4" or self.mode not in (
@@ -2693,7 +2829,15 @@ class _RobotControlWorker:
         self._disarm_mocap_reference_if_needed()
         self._clear_reference_gate()
         self._mocap_entry_requested = False
-        if self.mode in (RobotMode.STANDING, RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS, RobotMode.POLICY):
+        if self.mode in (
+            RobotMode.STANDING,
+            RobotMode.MOCAP,
+            RobotMode.ARMS,
+            RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
+            RobotMode.POLICY,
+        ):
             logger.info("DAMPING: sending LowCmd damping...")
             self.robot.set_damping()
             time.sleep(0.5)
@@ -2702,6 +2846,8 @@ class _RobotControlWorker:
         self.mode = RobotMode.DAMPING
         self._suspended_hold_joint_pos = None
         self._suspended_entry_from_idle = False
+        self._suspended_target_mode = RobotMode.SUSPENDED_ARMS
+        self._active_suspended_arm_indices = BOTH_ARMS_JOINT_INDICES
         self._publish_damping_record_step()
         self._ref_proc.last_reference_qpos = None
         self._mocap_reentry_armed = False
@@ -2773,7 +2919,13 @@ class _RobotControlWorker:
                 self._toggle_arms_mode()
                 continue
             if event.event_type == ControlEventType.TOGGLE_PAUSE:
-                if self.mode not in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS):
+                if self.mode not in (
+                    RobotMode.MOCAP,
+                    RobotMode.ARMS,
+                    RobotMode.SUSPENDED_ARMS,
+                    RobotMode.LEFT_SUSPENDED_ARMS,
+                    RobotMode.RIGHT_SUSPENDED_ARMS,
+                ):
                     continue
                 if self._mocap_session.state == MocapSessionState.PAUSED:
                     self._resume_paused_mocap()
@@ -2800,7 +2952,12 @@ class _RobotControlWorker:
         self._last_retarget_qpos = None
         self._last_commanded_motion_qpos = resume_qpos.copy()
         self._ref_proc.reset_alignment(target_qpos=resume_qpos)
-        if self.mode in (RobotMode.ARMS, RobotMode.SUSPENDED_ARMS):
+        if self.mode in (
+            RobotMode.ARMS,
+            RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
+        ):
             self._set_default_standing_reference(state)
             self._safety.start_kp_ramp(
                 duration_s=self._standing_return_ramp_duration,
@@ -2882,11 +3039,16 @@ class _RobotControlWorker:
         obs = self._ref_proc.validate_observation(obs)
         action = self.policy.compute_action(obs)
         target_dof_pos = self.policy.get_target_dof_pos(action)
-        if self.mode == RobotMode.SUSPENDED_ARMS:
+        if self.mode in (
+            RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
+        ):
             if self._suspended_hold_joint_pos is None:
-                raise RuntimeError("SUSPENDED_ARMS has no captured leg and waist positions")
+                raise RuntimeError(f"{self.mode.name} has no captured leg and waist positions")
+            active_indices = getattr(self, "_active_suspended_arm_indices", self._arm_joint_indices)
             action, target_dof_pos = hold_non_arm_joints(
-                action, target_dof_pos, self._suspended_hold_joint_pos, self._arm_joint_indices,
+                action, target_dof_pos, self._suspended_hold_joint_pos, active_indices,
             )
         target_dof_pos = self._safety.clip_to_joint_limits(target_dof_pos)
         self._safety.send_positions(target_dof_pos)
@@ -2908,7 +3070,13 @@ class _RobotControlWorker:
 
     def _publish_mode_state(self) -> None:
         self._mode_seq += 1
-        mocap_like = self.mode in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS)
+        mocap_like = self.mode in (
+            RobotMode.MOCAP,
+            RobotMode.ARMS,
+            RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
+        )
         active = mocap_like and self._mocap_session.state == MocapSessionState.ACTIVE
         paused = mocap_like and self._mocap_session.state == MocapSessionState.PAUSED
         self._mode_pub.publish(
@@ -2930,9 +3098,20 @@ class _RobotControlWorker:
         if self._record_pub is None:
             return
         record_mode = self._recording_mode_label()
-        mocap_like = self.mode in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS)
+        mocap_like = self.mode in (
+            RobotMode.MOCAP,
+            RobotMode.ARMS,
+            RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
+        )
         active = mocap_like and self._mocap_session.state == MocapSessionState.ACTIVE
-        recordable = self.mode not in (RobotMode.DAMPING, RobotMode.SUSPENDED_ARMS)
+        recordable = self.mode not in (
+            RobotMode.DAMPING,
+            RobotMode.SUSPENDED_ARMS,
+            RobotMode.LEFT_SUSPENDED_ARMS,
+            RobotMode.RIGHT_SUSPENDED_ARMS,
+        )
         try:
             self._record_pub.publish(
                 RECORD_TOPIC,
@@ -2943,7 +3122,12 @@ class _RobotControlWorker:
                     recordable=recordable,
                     observation_state=build_observation_state(robot_state).astype(np.float32, copy=True),
                     observation_mode=(
-                        -1 if self.mode == RobotMode.SUSPENDED_ARMS
+                        -1
+                        if self.mode in (
+                            RobotMode.SUSPENDED_ARMS,
+                            RobotMode.LEFT_SUSPENDED_ARMS,
+                            RobotMode.RIGHT_SUSPENDED_ARMS,
+                        )
                         else int(build_mode_observation(record_mode))
                     ),
                     action_reference_qpos=normalize_action_reference_qpos(reference_qpos).astype(np.float32, copy=True),
@@ -2977,7 +3161,13 @@ class _RobotControlWorker:
 
     def _recording_mode_label(self) -> str:
         if (
-            self.mode in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS)
+            self.mode in (
+                RobotMode.MOCAP,
+                RobotMode.ARMS,
+                RobotMode.SUSPENDED_ARMS,
+                RobotMode.LEFT_SUSPENDED_ARMS,
+                RobotMode.RIGHT_SUSPENDED_ARMS,
+            )
             and self._mocap_session.state == MocapSessionState.PAUSED
         ):
             return "pause"

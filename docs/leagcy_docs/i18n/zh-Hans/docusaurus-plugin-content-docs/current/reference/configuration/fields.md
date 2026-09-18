@@ -122,7 +122,7 @@ MuJoCo 窗口显示重定向参考；`sim2sim`、`mocap`、`camera` 和 `all`
 | `startup_ramp_duration` | 进入 `STANDING` 后的 Kp ramp 时长；逐步提高 PD 增益，不改变 policy target | `2.0` |
 | `joint_vel_limit` | 关节速度限制（rad/s），超过时触发急停 | `10.0` |
 | `mocap_switch.check_frames` | 切换到 MOCAP 前所需的连续有效帧数 | `10` |
-| `arm_mocap.controlled_joint_indices` | Pico `ARMS` 和 `SUSPENDED_ARMS` 模式下由实时重定向驱动的 G1 关节；在 `SUSPENDED_ARMS` 中，只有这些关节接收策略目标 | `[15..28]` |
+| `arm_mocap.controlled_joint_indices` | Pico `ARMS` 和悬吊手臂模式下由实时重定向驱动的 G1 关节；`LEFT_SUSPENDED_ARMS` 使用 15–21，`RIGHT_SUSPENDED_ARMS` 使用 22–28，`SUSPENDED_ARMS` 使用双臂 | `[15..28]` |
 
 ### 主机 High-Level Policy（独立 sim2real）
 

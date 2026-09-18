@@ -103,7 +103,7 @@ and `all` are simulation-only viewer modes.
 | `startup_ramp_duration` | Kp ramp duration after entering `STANDING`; gradually increases PD gains without changing policy targets | `2.0` |
 | `joint_vel_limit` | Joint velocity limit (rad/s); triggers emergency damping if exceeded | `10.0` |
 | `mocap_switch.check_frames` | Consecutive valid frames required before switching to MOCAP | `10` |
-| `arm_mocap.controlled_joint_indices` | G1 joints driven by live retargeting in Pico `ARMS` and `SUSPENDED_ARMS` modes; only these joints receive policy targets in `SUSPENDED_ARMS` | `[15..28]` |
+| `arm_mocap.controlled_joint_indices` | G1 joints driven by live retargeting in Pico `ARMS` and suspended arm modes; `LEFT_SUSPENDED_ARMS` uses 15–21, `RIGHT_SUSPENDED_ARMS` uses 22–28, and `SUSPENDED_ARMS` uses both | `[15..28]` |
 
 ### Host High-Level Policy (independent sim2real)
 

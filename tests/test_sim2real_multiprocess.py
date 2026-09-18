@@ -1155,18 +1155,36 @@ def test_robot_worker_checks_pico_reference_arm_while_entry_is_pending() -> None
     assert arm_checks == ["arm"]
 
 
-def test_laptop_f_requests_suspended_arms_without_recording() -> None:
+def test_laptop_1_2_3_request_suspended_arms_and_f_is_unmapped() -> None:
     runtime = object.__new__(Sim2RealRuntime)
     runtime.cfg = {"input": {"provider": "pico4"}, "recording": {"enabled": False}}
-    runtime._keyboard = SimpleNamespace(poll=lambda: (SimpleNamespace(key="f"),))
     commands: list[object] = []
     runtime._command_pub = SimpleNamespace(publish=lambda _topic, packet: commands.append(packet))
     runtime._console = SimpleNamespace(key_feedback=lambda *_args: None)
 
+    # Key 1 -> toggle_left_suspended_arms
+    runtime._keyboard = SimpleNamespace(poll=lambda: (SimpleNamespace(key="1"),))
     runtime._poll_terminal_controls()
 
     assert len(commands) == 1
-    assert commands[0].command == "toggle_suspended_arms"
+    assert commands[-1].command == "toggle_left_suspended_arms"
+
+    # Key 2 -> toggle_right_suspended_arms
+    runtime._keyboard = SimpleNamespace(poll=lambda: (SimpleNamespace(key="2"),))
+    runtime._poll_terminal_controls()
+    assert len(commands) == 2
+    assert commands[-1].command == "toggle_right_suspended_arms"
+
+    # Key 3 -> toggle_suspended_arms
+    runtime._keyboard = SimpleNamespace(poll=lambda: (SimpleNamespace(key="3"),))
+    runtime._poll_terminal_controls()
+    assert len(commands) == 3
+    assert commands[-1].command == "toggle_suspended_arms"
+
+    # Key F -> unmapped
+    runtime._keyboard = SimpleNamespace(poll=lambda: (SimpleNamespace(key="f"),))
+    runtime._poll_terminal_controls()
+    assert len(commands) == 3
 
 
 def test_suspended_arms_entry_waits_for_valid_pico_frames_and_times_out(monkeypatch) -> None:
@@ -1236,7 +1254,10 @@ def test_suspended_arms_entry_captures_measured_joint_positions() -> None:
     np.testing.assert_array_equal(worker._suspended_hold_joint_pos, measured)
 
 
-def test_suspended_arms_direct_entry_from_idle(monkeypatch) -> None:
+@pytest.mark.parametrize("target_mode", (
+    RobotMode.LEFT_SUSPENDED_ARMS, RobotMode.RIGHT_SUSPENDED_ARMS, RobotMode.SUSPENDED_ARMS,
+))
+def test_suspended_arms_direct_entry_from_idle(monkeypatch, target_mode: RobotMode) -> None:
     now_s = [100.0]
     monkeypatch.setattr("teleopit.sim2real.mp.runtime.time.monotonic", lambda: now_s[0])
     worker = object.__new__(_RobotControlWorker)
@@ -1271,26 +1292,26 @@ def test_suspended_arms_direct_entry_from_idle(monkeypatch) -> None:
     worker._build_robot_state_qpos = lambda _s: np.zeros(36, dtype=np.float64)
     worker._ref_proc = SimpleNamespace(last_reference_qpos=None)
     worker._mocap_session = SimpleNamespace(reset=lambda: None)
-    worker._transition_to_mocap = lambda **kwargs: setattr(worker, "mode", RobotMode.SUSPENDED_ARMS)
+    worker._transition_to_mocap = lambda **kwargs: setattr(worker, "mode", kwargs["entry_mode"])
     worker._set_default_standing_reference = lambda _s: None
 
-    # 1. Trigger F from IDLE
-    worker._toggle_suspended_arms_mode()
+    # Request a suspended arm mode directly from IDLE.
+    worker._toggle_suspended_arms_mode(target_mode)
     assert worker.mode == RobotMode.IDLE
     assert worker._suspended_entry_requested is True
     assert worker._suspended_entry_from_idle is True
 
-    # 2. Tracking becomes ready -> transitions to SUSPENDED_ARMS
+    # Tracking becomes ready and enters the requested mode.
     ready[0] = True
     worker._handle_transitions()
-    assert worker.mode == RobotMode.SUSPENDED_ARMS
+    assert worker.mode == target_mode
     assert worker._suspended_entry_requested is False
     assert "enter_debug" in debug_events
     assert "lock_joints" in debug_events
     assert "kp_ramp" in debug_events
     np.testing.assert_array_equal(worker._suspended_hold_joint_pos, measured)
 
-    # 3. Exit via F returns to IDLE without standing
+    # Pressing the active mode key again returns to IDLE without standing.
     exited_debug = []
     worker.robot.exit_debug_mode = lambda: exited_debug.append("exit_debug")
     standing_called = []
@@ -1298,16 +1319,19 @@ def test_suspended_arms_direct_entry_from_idle(monkeypatch) -> None:
     worker._disarm_mocap_reference_if_needed = lambda: None
     worker._clear_reference_gate = lambda: None
 
-    worker._toggle_suspended_arms_mode()
+    worker._toggle_suspended_arms_mode(target_mode)
     assert worker.mode == RobotMode.IDLE
     assert exited_debug == ["exit_debug"]
     assert standing_called == []
     assert worker._suspended_entry_from_idle is False
 
 
-def test_suspended_arms_remote_x_returns_to_idle_when_entered_from_idle() -> None:
+@pytest.mark.parametrize("mode", (
+    RobotMode.LEFT_SUSPENDED_ARMS, RobotMode.RIGHT_SUSPENDED_ARMS, RobotMode.SUSPENDED_ARMS,
+))
+def test_suspended_arms_remote_x_returns_to_idle_when_entered_from_idle(mode: RobotMode) -> None:
     worker = object.__new__(_RobotControlWorker)
-    worker.mode = RobotMode.SUSPENDED_ARMS
+    worker.mode = mode
     worker.high_level_policy_enabled = False
     worker.provider_kind = "pico4"
     worker._suspended_entry_from_idle = True
@@ -1324,6 +1348,73 @@ def test_suspended_arms_remote_x_returns_to_idle_when_entered_from_idle() -> Non
     assert worker.mode == RobotMode.IDLE
     assert exited == ["idle"]
 
+
+def test_single_arm_suspended_modes_and_on_the_fly_switching() -> None:
+    from teleopit.constants import LEFT_ARM_JOINT_INDICES, RIGHT_ARM_JOINT_INDICES, BOTH_ARMS_JOINT_INDICES
+    worker = object.__new__(_RobotControlWorker)
+    worker.provider_kind = "pico4"
+    worker.high_level_policy_enabled = False
+    worker.mode = RobotMode.STANDING
+    worker.num_actions = 29
+    worker._arm_joint_indices = np.arange(15, 29, dtype=np.int64)
+    worker._mocap_entry_requested = False
+    worker._mocap_reentry_armed = False
+    worker._suspended_entry_requested = False
+    worker._suspended_entry_from_idle = False
+    worker._suspended_target_mode = RobotMode.SUSPENDED_ARMS
+    worker._active_suspended_arm_indices = BOTH_ARMS_JOINT_INDICES
+    worker.remote = SimpleNamespace(Y=SimpleNamespace(on_pressed=False, pressed=False))
+    worker._arm_mocap_reference_if_needed = lambda: None
+    worker._can_switch_to_mocap = lambda: True
+    worker._transition_to_mocap = lambda *, entry_mode, entry_state: setattr(worker, "mode", entry_mode)
+    worker._set_default_standing_reference = lambda _s: None
+
+    initial_qpos = np.zeros(29, dtype=np.float32)
+    state = SimpleNamespace(qpos=initial_qpos)
+    worker.robot = SimpleNamespace(get_state=lambda: state)
+    worker._safety = SimpleNamespace(clip_to_joint_limits=lambda target: target)
+
+    # 1. Request LEFT_SUSPENDED_ARMS (key 1) from STANDING
+    worker._toggle_suspended_arms_mode(RobotMode.LEFT_SUSPENDED_ARMS)
+    assert worker._suspended_entry_requested is True
+    assert worker._suspended_target_mode == RobotMode.LEFT_SUSPENDED_ARMS
+    worker._handle_transitions()
+    assert worker.mode == RobotMode.LEFT_SUSPENDED_ARMS
+    assert worker._active_suspended_arm_indices == LEFT_ARM_JOINT_INDICES
+
+    # 2. On-the-fly switch to RIGHT_SUSPENDED_ARMS (key 2)
+    # Simulate left arm moved to 0.5 rad
+    current_qpos = initial_qpos.copy()
+    current_qpos[:15] = 0.2
+    current_qpos[15:22] = 0.5
+    state.qpos = current_qpos
+    worker._toggle_suspended_arms_mode(RobotMode.RIGHT_SUSPENDED_ARMS)
+    assert worker.mode == RobotMode.RIGHT_SUSPENDED_ARMS
+    assert worker._active_suspended_arm_indices == RIGHT_ARM_JOINT_INDICES
+    # Left arm must be frozen at its current position (0.5 rad)
+    np.testing.assert_allclose(worker._suspended_hold_joint_pos[15:22], 0.5)
+    np.testing.assert_allclose(worker._suspended_hold_joint_pos[:15], 0.0)
+
+    # 3. On-the-fly switch to BOTH ARMS (key 3)
+    worker._toggle_suspended_arms_mode(RobotMode.SUSPENDED_ARMS)
+    assert worker.mode == RobotMode.SUSPENDED_ARMS
+    assert worker._active_suspended_arm_indices == BOTH_ARMS_JOINT_INDICES
+
+    # 4. Pico B toggle is ignored in single-arm modes
+    worker._mocap_session = SimpleNamespace(state=MocapSessionState.ACTIVE)
+    worker.mode = RobotMode.LEFT_SUSPENDED_ARMS
+    worker._toggle_arms_mode()
+    assert worker.mode == RobotMode.LEFT_SUSPENDED_ARMS
+
+    worker.mode = RobotMode.RIGHT_SUSPENDED_ARMS
+    worker._toggle_arms_mode()
+    assert worker.mode == RobotMode.RIGHT_SUSPENDED_ARMS
+
+    # 5. Re-pressing active mode's key exits back to origin (STANDING)
+    standing_called = []
+    worker._enter_standing = lambda: standing_called.append(True)
+    worker._toggle_suspended_arms_mode(RobotMode.RIGHT_SUSPENDED_ARMS)
+    assert standing_called == [True]
 
 
 def test_robot_worker_disarms_pico_reference_and_clears_gate() -> None:
@@ -1516,6 +1607,22 @@ def test_suspended_arms_keeps_captured_non_arm_targets_and_applies_arm_policy() 
     np.testing.assert_array_equal(policy_targets, np.full(29, 1.2, dtype=np.float32))
 
 
+@pytest.mark.parametrize("active_indices", (tuple(range(15, 22)), tuple(range(22, 29))))
+def test_single_suspended_arm_holds_other_arm_and_body(active_indices: tuple[int, ...]) -> None:
+    action = np.full(29, 0.4, dtype=np.float32)
+    policy_targets = np.full(29, 1.2, dtype=np.float32)
+    captured = np.linspace(-0.3, 0.3, 29, dtype=np.float32)
+
+    applied_action, targets = hold_non_arm_joints(action, policy_targets, captured, active_indices)
+
+    held_mask = np.ones(29, dtype=bool)
+    held_mask[list(active_indices)] = False
+    np.testing.assert_array_equal(applied_action[held_mask], 0.0)
+    np.testing.assert_array_equal(targets[held_mask], captured[held_mask])
+    np.testing.assert_array_equal(applied_action[list(active_indices)], action[list(active_indices)])
+    np.testing.assert_array_equal(targets[list(active_indices)], policy_targets[list(active_indices)])
+
+
 def test_robot_worker_pico_arms_event_toggles_mocap_and_arms() -> None:
     worker = object.__new__(_RobotControlWorker)
     worker.provider_kind = "pico4"
@@ -1653,9 +1760,12 @@ def test_robot_worker_publish_record_step() -> None:
     np.testing.assert_allclose(packet.action_reference_qpos, reference_qpos.astype(np.float32))
 
 
-def test_suspended_arms_record_packet_is_not_recordable() -> None:
+@pytest.mark.parametrize("mode", (
+    RobotMode.LEFT_SUSPENDED_ARMS, RobotMode.RIGHT_SUSPENDED_ARMS, RobotMode.SUSPENDED_ARMS,
+))
+def test_suspended_arms_record_packet_is_not_recordable(mode: RobotMode) -> None:
     worker = object.__new__(_RobotControlWorker)
-    worker.mode = RobotMode.SUSPENDED_ARMS
+    worker.mode = mode
     worker._mocap_session = SimpleNamespace(state=MocapSessionState.ACTIVE)
     worker._mode_seq = 1
     published: list[object] = []
@@ -1670,17 +1780,25 @@ def test_suspended_arms_record_packet_is_not_recordable() -> None:
     worker._publish_record_step(robot_state=state, reference_qpos=np.zeros(36, dtype=np.float64))
 
     packet = published[0]
-    assert packet.mode == "suspended_arms"
+    assert packet.mode == mode.value
     assert packet.recordable is False
     assert packet.observation_mode == -1
 
 
-def test_suspended_arms_stale_reference_holds_non_arm_motor_targets() -> None:
+@pytest.mark.parametrize("mode,active_indices", (
+    (RobotMode.LEFT_SUSPENDED_ARMS, tuple(range(15, 22))),
+    (RobotMode.RIGHT_SUSPENDED_ARMS, tuple(range(22, 29))),
+    (RobotMode.SUSPENDED_ARMS, tuple(range(15, 29))),
+))
+def test_suspended_arms_stale_reference_holds_non_arm_motor_targets(
+    mode: RobotMode, active_indices: tuple[int, ...],
+) -> None:
     worker = object.__new__(_RobotControlWorker)
-    worker.mode = RobotMode.SUSPENDED_ARMS
+    worker.mode = mode
     worker.num_actions = 29
     worker.policy_hz = 50.0
     worker._arm_joint_indices = np.arange(15, 29, dtype=np.int64)
+    worker._active_suspended_arm_indices = active_indices
     worker._suspended_hold_joint_pos = np.linspace(-0.3, 0.3, 29, dtype=np.float32)
     worker._last_action = np.zeros(29, dtype=np.float32)
     worker.obs_builder = SimpleNamespace()
@@ -1704,17 +1822,27 @@ def test_suspended_arms_stale_reference_holds_non_arm_motor_targets() -> None:
 
     worker._run_static_mocap_step(np.zeros(36, dtype=np.float64))
 
-    np.testing.assert_array_equal(sent[0][:15], worker._suspended_hold_joint_pos[:15])
-    np.testing.assert_array_equal(sent[0][15:], np.full(14, 1.2, dtype=np.float32))
-    np.testing.assert_array_equal(worker._last_action[:15], np.zeros(15, dtype=np.float32))
+    held_mask = np.ones(29, dtype=bool)
+    held_mask[list(active_indices)] = False
+    np.testing.assert_array_equal(sent[0][held_mask], worker._suspended_hold_joint_pos[held_mask])
+    np.testing.assert_array_equal(sent[0][list(active_indices)], np.full(len(active_indices), 1.2, dtype=np.float32))
+    np.testing.assert_array_equal(worker._last_action[held_mask], 0.0)
 
 
-def test_suspended_arms_live_reference_tracks_arms_and_holds_non_arm_motors() -> None:
+@pytest.mark.parametrize("mode,active_indices", (
+    (RobotMode.LEFT_SUSPENDED_ARMS, tuple(range(15, 22))),
+    (RobotMode.RIGHT_SUSPENDED_ARMS, tuple(range(22, 29))),
+    (RobotMode.SUSPENDED_ARMS, tuple(range(15, 29))),
+))
+def test_suspended_arms_live_reference_tracks_arms_and_holds_non_arm_motors(
+    mode: RobotMode, active_indices: tuple[int, ...],
+) -> None:
     worker = object.__new__(_RobotControlWorker)
-    worker.mode = RobotMode.SUSPENDED_ARMS
+    worker.mode = mode
     worker.num_actions = 29
     worker.policy_hz = 50.0
     worker._arm_joint_indices = np.arange(15, 29, dtype=np.int64)
+    worker._active_suspended_arm_indices = active_indices
     worker._suspended_hold_joint_pos = np.linspace(-0.3, 0.3, 29, dtype=np.float32)
     worker._standing_qpos = np.zeros(36, dtype=np.float64)
     worker._standing_qpos[3] = 1.0
@@ -1755,8 +1883,10 @@ def test_suspended_arms_live_reference_tracks_arms_and_holds_non_arm_motors() ->
 
     np.testing.assert_array_equal(seen_reference[0][7:22], np.zeros(15, dtype=np.float32))
     np.testing.assert_array_equal(seen_reference[0][22:36], np.full(14, 2.0, dtype=np.float32))
-    np.testing.assert_array_equal(sent[0][:15], worker._suspended_hold_joint_pos[:15])
-    np.testing.assert_array_equal(sent[0][15:], np.full(14, 1.2, dtype=np.float32))
+    held_mask = np.ones(29, dtype=bool)
+    held_mask[list(active_indices)] = False
+    np.testing.assert_array_equal(sent[0][held_mask], worker._suspended_hold_joint_pos[held_mask])
+    np.testing.assert_array_equal(sent[0][list(active_indices)], np.full(len(active_indices), 1.2, dtype=np.float32))
 
 
 def test_robot_worker_enter_damping_publishes_non_recordable_packet() -> None:

@@ -8,7 +8,9 @@ from typing import Any
 
 from teleopit.runtime.common import cfg_get
 
-VALID_NECK_ACTIVE_MODES = frozenset(("standing", "mocap", "arms", "suspended_arms", "pause"))
+VALID_NECK_ACTIVE_MODES = frozenset((
+    "standing", "mocap", "arms", "suspended_arms", "left_suspended_arms", "right_suspended_arms", "pause"
+))
 REMOVED_NECK_CONFIG_KEYS = (
     "yaw_range_deg",
     "pitch_range_deg",
@@ -25,7 +27,9 @@ class NeckConfig:
     port: str | None = None
     rate_hz: float = 60.0
     frame_timeout_s: float = 0.2
-    active_modes: tuple[str, ...] = ("standing", "mocap", "arms", "suspended_arms", "pause")
+    active_modes: tuple[str, ...] = (
+        "standing", "mocap", "arms", "suspended_arms", "left_suspended_arms", "right_suspended_arms", "pause"
+    )
     dead_zone_deg: float = 0.5
     pitch_gain: float = 1.4
     center_on_start: bool = True
@@ -43,7 +47,10 @@ def parse_neck_config(cfg: Any) -> NeckConfig:
             f"{', '.join(removed)}. Teleopit now sends head angles in degrees; "
             "configure motor direction and mechanical limits in the OpenNeck calibration file."
         )
-    active_modes = _parse_active_modes(cfg_get(neck_cfg, "active_modes", ["standing", "mocap", "arms", "suspended_arms", "pause"]))
+    active_modes = _parse_active_modes(cfg_get(
+        neck_cfg, "active_modes",
+        ["standing", "mocap", "arms", "suspended_arms", "left_suspended_arms", "right_suspended_arms", "pause"],
+    ))
     rate_hz = float(cfg_get(neck_cfg, "rate_hz", 60.0))
     if rate_hz <= 0:
         raise ValueError("neck.rate_hz must be > 0")

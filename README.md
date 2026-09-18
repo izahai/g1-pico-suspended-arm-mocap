@@ -261,10 +261,11 @@ python scripts/run/run_sim.py --config-name pico4_sim controller.policy_path=ckp
 ```
 
 The sim starts in `STANDING`. With the MuJoCo window focused, keyboard **Y**
-enters MOCAP (stand still, neutral pose first), **F** enters `SUSPENDED_ARMS`,
-**X** returns to STANDING, and **Q** quits. Press **F** again in
-`SUSPENDED_ARMS` to return to STANDING. PICO controller **A** pauses/resumes;
-**B** toggles MOCAP/ARMS and switches `SUSPENDED_ARMS` to regular ARMS.
+enters MOCAP (stand still, neutral pose first), **1** controls the left arm,
+**2** controls the right arm, and **3** controls both arms while the other joints
+hold position. Press the active number again to return to STANDING; **X** also
+returns to STANDING, and **Q** quits. PICO controller **A** pauses/resumes;
+**B** toggles MOCAP/ARMS and switches the both-arm suspended mode to regular ARMS.
 `viewers=sim2sim` shows only the physics view; `viewers=none` is headless.
 The joystick walking mode of section 6 is implemented for the real robot only;
 in sim you walk with your body.
@@ -301,14 +302,15 @@ conda activate teleopit
 bash run/real_mocap.sh --interactive
 ```
 
-Keep this terminal open to use **F** from STANDING for `SUSPENDED_ARMS`; press
-**F** again to return to STANDING. The launcher stops the port squatter, kills
+Keep this terminal open to use **1**, **2**, or **3** from IDLE or STANDING for
+left, right, or both suspended arms. Press the active number again to return to
+the mode you entered from. The launcher stops the port squatter, kills
 stale Teleopit processes, refuses to run if an onboard session is active,
 detects the robot interface, launches `run_sim2real.py` with `pico4_sim2real`,
 and prints the runtime output in this
 terminal. To retain the background session workflow, use
 `bash run/real_mocap.sh` without `--interactive`; that mode logs to
-`/tmp/session_monitor/sim2real.log` and cannot receive F. Equivalent manual
+`/tmp/session_monitor/sim2real.log` and cannot receive keyboard mode keys. Equivalent manual
 interactive command:
 
 ```bash
@@ -348,18 +350,20 @@ steps in place, then walking. One new thing at a time.
 |---|---|
 | Freeze the robot in its current pose (re-strap a tracker, rest) | Unitree remote **B** or PICO **A** = pause. Same button resumes. Resume standing still and close to the held pose. |
 | Only arms follow, legs/waist hold the standing pose | PICO **B** toggles `ARMS` mode. |
-| Suspended robot: arms follow while legs/waist hold their measured entry angles | Press **F** in the interactive Teleopit terminal from STANDING. Press **F** again to return to STANDING. |
+| Suspended robot: one or both arms follow while other joints hold their measured angles | Press **1** for left, **2** for right, or **3** for both in the interactive Teleopit terminal from IDLE or STANDING. Press the active number again to return to the mode of origin. |
 | Move the robot further than the tracking space allows | PICO **right-stick click** → `JOYSTICK` mode, section 6. |
 | Unexpected motion, not yet dangerous | Remote **X** → STANDING (fast 0.5 s gain ramp back to the standing policy). |
 | Emergency | Remote **L1+R1** → DAMPING, robot goes limp on the tether. Log: `EMERGENCY STOP (L1+R1)`. |
 
-`SUSPENDED_ARMS` uses the ARMS reference but replaces all non-arm policy targets
-with the captured leg and waist angles. The non-arm joints remain under PD
-position control. A single **F** press wakes the Pico reference worker and
-waits up to 2 s for valid tracking; if tracking is unavailable, entry is
-cancelled and another **F** press is required. PICO **B** switches to regular
-ARMS, which restores policy control of the legs and waist. Recording cannot
-start in `SUSPENDED_ARMS`; entering it discards an active episode.
+The suspended arm modes use the ARMS reference but replace policy targets for
+every inactive joint with its captured measured angle under PD position control.
+Switch directly among **1**, **2**, and **3**; an arm that becomes inactive holds
+its measured angle while the legs and waist retain their original hold targets.
+Each entry key wakes the Pico reference worker and waits up to 2 s for valid
+tracking; if unavailable, press a number again after tracking recovers. PICO
+**B** switches the both-arm mode to regular ARMS, restoring full policy control;
+it is ignored in single-arm modes. Suspended arm modes cannot be recorded;
+entering one discards an active episode.
 
 If the PICO stream stops, the robot holds the last reference; it does not
 change mode on its own. Use **X**, or **L1+R1** if needed.
@@ -415,8 +419,8 @@ exit; this fixed a collapse caused by a stale yaw on mode swap.
 | **Start** | IDLE, DAMPING | → STANDING (joint lock, then 2 s Kp ramp into the standing policy). |
 | **Y** | STANDING | → MOCAP after 10 valid PICO frames (1 s joint blend-in). Refused with a log message if tracking is not valid. |
 | **Y** | JOYSTICK | → STANDING, 1.5 s settle, then waits for an explicit second **Y**. |
-| **X** | MOCAP, ARMS, SUSPENDED_ARMS, JOYSTICK | → STANDING (0.5 s fast ramp). Also cancels a pending settle. |
-| **B** | MOCAP, ARMS, SUSPENDED_ARMS | Pause / resume (reference held). |
+| **X** | MOCAP, ARMS, suspended arm modes, JOYSTICK | → STANDING (or IDLE when a suspended arm mode was entered from IDLE). Also cancels a pending settle. |
+| **B** | MOCAP, ARMS, suspended arm modes | Pause / resume (reference held). |
 | **L1+R1** | any | **EMERGENCY DAMPING.** Motors go to damping (kd 8), robot collapses onto the tether. |
 | L2+B, Select, A | — | Not used by Teleopit. L2+B (factory damp) is dead while Teleopit runs. |
 
@@ -426,8 +430,8 @@ State machine diagram: [`docs/static/img/diagrams/pico-g1-state-machine.svg`](do
 
 | Control | Effect |
 |---|---|
-| **A** | Pause / resume the current MOCAP, ARMS, or SUSPENDED_ARMS session (sim and real). |
-| **B** | Toggle MOCAP/ARMS, or switch SUSPENDED_ARMS to regular ARMS (sim and real). |
+| **A** | Pause / resume the current MOCAP, ARMS, or suspended arm session (sim and real). |
+| **B** | Toggle MOCAP/ARMS, or switch the both-arm suspended mode to regular ARMS; ignored in single-arm modes. |
 | **Right stick click** | Toggle JOYSTICK walking mode (real robot only). |
 | Left stick up/down | JOYSTICK: forward / back. |
 | Right stick left/right | JOYSTICK: turn. |
@@ -436,10 +440,11 @@ State machine diagram: [`docs/static/img/diagrams/pico-g1-state-machine.svg`](do
 
 ### Keyboard
 
-In simulation: **Y** MOCAP · **F** toggle SUSPENDED_ARMS from STANDING · **B**
-toggle MOCAP/ARMS · **X** STANDING · **A** pause/resume · **Q** quit. The Unitree
-remote is not read in simulation. For sim2real, press **F** in the interactive
-terminal running Teleopit; recording keys **R/S/D/Q** remain unchanged.
+In simulation: **Y** MOCAP · **1** left suspended arm · **2** right suspended
+arm · **3** both suspended arms · **B** toggle MOCAP/ARMS · **X** exit · **A**
+pause/resume · **Q** quit. The Unitree remote is not read in simulation. For
+sim2real, press **1/2/3** in the interactive terminal running Teleopit;
+recording keys **R/S/D/Q** remain unchanged.
 
 ### Factory controller (no Teleopit running)
 

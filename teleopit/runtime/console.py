@@ -218,8 +218,10 @@ def sim_keyboard_controls(cfg: Any) -> tuple[KeyboardControl, ...]:
             KeyboardControl("Y", "mocap"),
             KeyboardControl("A", "pause/resume"),
             KeyboardControl("B", "arms"),
-            KeyboardControl("F", "suspended arms"),
-            KeyboardControl("X", "standing"),
+            KeyboardControl("1", "left suspended arm"),
+            KeyboardControl("2", "right suspended arm"),
+            KeyboardControl("3", "suspended arms"),
+            KeyboardControl("X", "standing/idle"),
             KeyboardControl("Q", "quit"),
         )
 
@@ -239,7 +241,11 @@ def sim2real_keyboard_controls(cfg: Any) -> tuple[KeyboardControl, ...]:
     recording_cfg = cfg_get(cfg, "recording", {}) or {}
     controls = []
     if str(cfg_get(input_cfg, "provider", "bvh")).lower() == "pico4":
-        controls.append(KeyboardControl("F", "suspended arms"))
+        controls.extend((
+            KeyboardControl("1", "left suspended arm"),
+            KeyboardControl("2", "right suspended arm"),
+            KeyboardControl("3", "suspended arms"),
+        ))
     if bool(cfg_get(recording_cfg, "enabled", False)):
         controls.extend((
             KeyboardControl("R", "start"),

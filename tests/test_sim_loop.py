@@ -800,7 +800,7 @@ def test_simulation_loop_pico_arms_mode_composes_standing_body_with_live_arm(mon
 
 
 @requires_mujoco
-@pytest.mark.parametrize("exit_control", ["f", "b"])
+@pytest.mark.parametrize("exit_control", ["3", "b"])
 def test_suspended_arms_holds_non_arm_targets_until_exit(monkeypatch, exit_control: str) -> None:
     from teleopit.sim.loop import SimulationLoop
 
@@ -833,8 +833,8 @@ def test_suspended_arms_holds_non_arm_targets_until_exit(monkeypatch, exit_contr
 
     class _KeyboardReader:
         def __init__(self) -> None:
-            exit_events = (TerminalKeyEvent("f"),) if exit_control == "f" else ()
-            self.polls = iter(((TerminalKeyEvent("f"),), (), exit_events))
+            exit_events = (TerminalKeyEvent("3"),) if exit_control == "3" else ()
+            self.polls = iter(((TerminalKeyEvent("3"),), (), exit_events))
 
         @property
         def active(self) -> bool:
@@ -882,15 +882,118 @@ def test_suspended_arms_holds_non_arm_targets_until_exit(monkeypatch, exit_contr
     assert robot.torques[2][0] != 0.0
 
 
+@requires_mujoco
+@pytest.mark.parametrize("entry_key,active_indices", (
+    ("1", tuple(range(15, 22))),
+    ("2", tuple(range(22, 29))),
+    ("3", tuple(range(15, 29))),
+))
+def test_suspended_arm_sim2sim_applies_torque_only_to_selected_arms(
+    monkeypatch, entry_key: str, active_indices: tuple[int, ...],
+) -> None:
+    from teleopit.sim.loop import SimulationLoop
+
+    class _RealtimeInputProvider:
+        fps = 50
+
+        def has_frame(self) -> bool:
+            return True
+
+        def pop_control_events(self):
+            return ()
+
+        def get_realtime_input_packet(self):
+            return RealtimeInputPacket(
+                frame={"Pelvis": (
+                    np.zeros(3, dtype=np.float32),
+                    np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                )},
+                timestamp_s=time.monotonic(),
+                seq=0,
+            )
+
+    class _KeyboardReader:
+        active = True
+
+        def __init__(self) -> None:
+            self._first = True
+
+        def poll(self):
+            if self._first:
+                self._first = False
+                return (TerminalKeyEvent(entry_key),)
+            return ()
+
+        def close(self) -> None:
+            pass
+
+    class _Robot(_DummyRobot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.num_actions = 29
+            self.kps = np.ones(29, dtype=np.float32)
+            self.kds = np.zeros(29, dtype=np.float32)
+            self.torque_limits = np.full(29, 10.0, dtype=np.float32)
+            self.default_dof_pos = np.zeros(29, dtype=np.float32)
+            self._qpos = np.zeros(29, dtype=np.float32)
+            self._qvel = np.zeros(29, dtype=np.float32)
+            self.torques: list[np.ndarray] = []
+
+        def set_action(self, action: np.ndarray) -> None:
+            self._last_action = np.asarray(action, dtype=np.float32).copy()
+            self.torques.append(self._last_action.copy())
+
+        def step(self) -> None:
+            self._qvel = self._last_action.copy()
+            self._qpos += self._last_action * 0.01
+            self._timestamp += 0.02
+
+    class _Controller(_DummyController):
+        def compute_action(self, obs: np.ndarray) -> np.ndarray:
+            return np.full(29, 0.1, dtype=np.float32)
+
+    monkeypatch.setattr("teleopit.sim.session.TerminalKeyboardReader", _KeyboardReader)
+    robot = _Robot()
+    loop = SimulationLoop(
+        robot=robot,
+        controller=_Controller(),
+        obs_builder=_DummyObsBuilder(),
+        bus=InProcessBus(),
+        cfg={
+            "policy_hz": 50.0,
+            "pd_hz": 50.0,
+            "realtime": False,
+            "retarget_buffer_enabled": False,
+            "keyboard": {"enabled": True},
+            "arm_mocap": {"controlled_joint_indices": list(range(15, 29))},
+        },
+        viewers=set(),
+    )
+
+    loop.run(input_provider=_RealtimeInputProvider(), retargeter=_DummyRetargeter(), num_steps=1)
+
+    assert len(robot.torques) == 1
+    held_mask = np.ones(29, dtype=bool)
+    held_mask[list(active_indices)] = False
+    np.testing.assert_array_equal(robot.torques[0][held_mask], 0.0)
+    assert np.all(robot.torques[0][list(active_indices)] > 0.0)
+
+
 def test_suspended_arms_sim2sim_direct_entry_from_idle(monkeypatch) -> None:
     import time
     from types import SimpleNamespace
     from teleopit.sim.loop import SimulationLoop, SimulationMode
     from teleopit.sim.session import SimLoopSession
+    from teleopit.constants import LEFT_ARM_JOINT_INDICES, RIGHT_ARM_JOINT_INDICES, BOTH_ARMS_JOINT_INDICES
 
     class _KeyboardReader:
         active = True
-        polls = iter(((TerminalKeyEvent("f"),), (TerminalKeyEvent("f"),)))
+        polls = iter((
+            (TerminalKeyEvent("1"),),
+            (TerminalKeyEvent("2"),),
+            (TerminalKeyEvent("3"),),
+            (TerminalKeyEvent("3"),),
+        ))
         def poll(self):
             return next(self.polls, ())
         def close(self):
@@ -910,6 +1013,11 @@ def test_suspended_arms_sim2sim_direct_entry_from_idle(monkeypatch) -> None:
         },
         viewers=set(),
     )
+    loop._num_actions = 29
+    loop._arm_joint_indices = np.arange(15, 29, dtype=np.int64)
+    state = SimpleNamespace(qpos=np.zeros(29, dtype=np.float32))
+    loop.robot.get_state = lambda: state
+    loop._set_standing_reference = lambda _state: None
     session = SimLoopSession(loop, input_provider=None, retargeter=None, num_steps=10)
     session.keyboard_reader = _KeyboardReader()
     session.simulation_mode = SimulationMode.IDLE
@@ -918,12 +1026,29 @@ def test_suspended_arms_sim2sim_direct_entry_from_idle(monkeypatch) -> None:
     loop._fetch_realtime_input_packet = lambda _ip, _seq: SimpleNamespace(timestamp_s=time.monotonic())
     session.enter_mocap_mode = lambda: True
 
-    # 1. First 'f' event: enters SUSPENDED_ARMS from IDLE
+    # 1. Key '1': enters LEFT_SUSPENDED_ARMS from IDLE
     session._handle_realtime_keyboard()
-    assert session.simulation_mode == SimulationMode.SUSPENDED_ARMS
+    assert session.simulation_mode == SimulationMode.LEFT_SUSPENDED_ARMS
+    assert session._active_suspended_arm_indices == LEFT_ARM_JOINT_INDICES
     assert session._suspended_entry_from_idle is True
 
-    # 2. Second 'f' event: exits SUSPENDED_ARMS back to IDLE
+    # 2. Key '2': switches to RIGHT_SUSPENDED_ARMS on the fly
+    state.qpos[:15] = 0.2
+    state.qpos[15:22] = 0.5
+    session._handle_realtime_keyboard()
+    assert session.simulation_mode == SimulationMode.RIGHT_SUSPENDED_ARMS
+    assert session._active_suspended_arm_indices == RIGHT_ARM_JOINT_INDICES
+    assert session._suspended_entry_from_idle is True
+    np.testing.assert_array_equal(session._suspended_hold_joint_pos[:15], 0.0)
+    np.testing.assert_array_equal(session._suspended_hold_joint_pos[15:22], 0.5)
+
+    # 3. Key '3': switches to SUSPENDED_ARMS (both)
+    session._handle_realtime_keyboard()
+    assert session.simulation_mode == SimulationMode.SUSPENDED_ARMS
+    assert session._active_suspended_arm_indices == BOTH_ARMS_JOINT_INDICES
+    assert session._suspended_entry_from_idle is True
+
+    # 4. Key '3' again: exits back to IDLE
     session._handle_realtime_keyboard()
     assert session.simulation_mode == SimulationMode.IDLE
     assert session._suspended_entry_from_idle is False
@@ -1030,7 +1155,7 @@ def test_simulation_loop_realtime_keyboard_mode_drains_stale_pause_events(monkey
 
 
 @requires_mujoco
-@pytest.mark.parametrize("entry_key", ["y", "f"])
+@pytest.mark.parametrize("entry_key", ["y", "1", "2", "3"])
 def test_simulation_loop_realtime_keyboard_mode_keeps_standing_when_input_not_ready(monkeypatch, entry_key: str) -> None:
     from teleopit.sim.loop import SimulationLoop
 

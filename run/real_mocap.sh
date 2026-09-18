@@ -23,7 +23,7 @@ case "${1:-}" in
   *) echo "Usage: bash run/real_mocap.sh [--interactive]" >&2; exit 2 ;;
 esac
 if [ "$INTERACTIVE" -eq 1 ] && [ ! -t 0 ]; then
-  echo "ABORT: --interactive requires a terminal for F keyboard control." >&2
+  echo "ABORT: --interactive requires a terminal for 1/2/3 keyboard control." >&2
   exit 1
 fi
 cd "$(dirname "$0")/.."
@@ -84,7 +84,7 @@ CMD=("$PY" -u scripts/run/run_sim2real.py \
     controller.policy_path="$POLICY" \
     real_robot.network_interface="$IFACE")
 if [ "$INTERACTIVE" -eq 1 ]; then
-  echo "interface=$IFACE  policy=$POLICY  interactive terminal controls: F=suspended arms, H=help"
+  echo "interface=$IFACE  policy=$POLICY  interactive terminal controls: 1=left arm, 2=right arm, 3=both arms, H=help"
   exec "${CMD[@]}"
 fi
 echo "interface=$IFACE  policy=$POLICY  log=$LOG"

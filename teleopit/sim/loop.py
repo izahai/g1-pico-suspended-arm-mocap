@@ -38,6 +38,8 @@ class SimulationMode(Enum):
     MOCAP = "mocap"
     ARMS = "arms"
     SUSPENDED_ARMS = "suspended_arms"
+    LEFT_SUSPENDED_ARMS = "left_suspended_arms"
+    RIGHT_SUSPENDED_ARMS = "right_suspended_arms"
 
 
 @final

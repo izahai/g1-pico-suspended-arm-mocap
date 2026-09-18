@@ -39,3 +39,8 @@ G1_JOINT_NAMES = (
     "right_wrist_pitch_joint",
     "right_wrist_yaw_joint",
 )
+
+# G1 Arm joint index ranges within the 29-DoF actuator array:
+LEFT_ARM_JOINT_INDICES = tuple(range(15, 22))    # [15..21] (7 DoF)
+RIGHT_ARM_JOINT_INDICES = tuple(range(22, 29))   # [22..28] (7 DoF)
+BOTH_ARMS_JOINT_INDICES = tuple(range(15, 29))   # [15..28] (14 DoF)

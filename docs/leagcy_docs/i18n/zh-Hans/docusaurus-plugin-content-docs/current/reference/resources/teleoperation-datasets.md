@@ -22,8 +22,9 @@ python scripts/run/run_sim2real.py --config-name sim2real_record \
 `input.video.enabled=true` 和 `input.video.source=realsense`。
 
 终端按 `R` 开始一条 episode，按 `S` 保存，按 `D` 丢弃，按 `Q` 关闭运行时。
-`STANDING`、`MOCAP`、`ARMS` 和动捕暂停状态都可以录制。`SUSPENDED_ARMS`
-不可录制；进入该模式会丢弃正在录制的 episode。没有新鲜相机帧时不能开始
+`STANDING`、`MOCAP`、`ARMS` 和动捕暂停状态都可以录制。
+`LEFT_SUSPENDED_ARMS`、`RIGHT_SUSPENDED_ARMS` 和 `SUSPENDED_ARMS`
+不可录制；进入任一模式都会丢弃正在录制的 episode。没有新鲜相机帧时不能开始
 录制；录制过程中相机画面超过一秒未更新时，当前 episode 会被丢弃，但 Pico 输入和
 G1 控制继续运行。视频恢复后不会自动重新开始录制。
 

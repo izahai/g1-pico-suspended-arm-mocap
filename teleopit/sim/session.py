@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from teleopit.constants import (
+    LEFT_ARM_JOINT_INDICES,
+    RIGHT_ARM_JOINT_INDICES,
+)
 from teleopit.debug.rollout_trace import RolloutTraceWriter
 from teleopit.interfaces import InputProvider, Retargeter, RobotState
 from teleopit.sim.reference_motion import (
@@ -193,6 +197,7 @@ class SimLoopSession:
         )
         self._suspended_hold_joint_pos: Float32Array | None = None
         self._suspended_entry_from_idle: bool = False
+        self._active_suspended_arm_indices: tuple[int, ...] = loop._arm_joint_indices
         if self.simulation_mode == SimulationMode.STANDING:
             loop._set_standing_reference(loop.robot.get_state())
 
@@ -247,6 +252,7 @@ class SimLoopSession:
         self.reset_policy_reference_state()
         self._suspended_hold_joint_pos = None
         self._suspended_entry_from_idle = False
+        self._active_suspended_arm_indices = self._loop._arm_joint_indices
         self.simulation_mode = SimulationMode.IDLE
 
     def enter_standing_mode(self) -> None:
@@ -255,6 +261,7 @@ class SimLoopSession:
         self._loop._set_standing_reference(self._loop.robot.get_state())
         self._suspended_hold_joint_pos = None
         self._suspended_entry_from_idle = False
+        self._active_suspended_arm_indices = self._loop._arm_joint_indices
         self.simulation_mode = SimulationMode.STANDING
 
     def enter_mocap_mode(self) -> bool:
@@ -275,15 +282,45 @@ class SimLoopSession:
         self.simulation_mode = SimulationMode.MOCAP
         return True
 
-    def enter_suspended_arms_mode(self) -> bool:
+    def enter_suspended_arms_mode(self, target_mode: SimulationMode | None = None) -> bool:
         from teleopit.sim.loop import SimulationMode
+        if target_mode is None:
+            target_mode = SimulationMode.SUSPENDED_ARMS
         loop = self._loop
+        suspended_modes = (
+            SimulationMode.SUSPENDED_ARMS,
+            SimulationMode.LEFT_SUSPENDED_ARMS,
+            SimulationMode.RIGHT_SUSPENDED_ARMS,
+        )
+        configured_arms = tuple(int(index) for index in loop._arm_joint_indices)
+        if target_mode == SimulationMode.LEFT_SUSPENDED_ARMS:
+            active_indices = tuple(index for index in configured_arms if index in LEFT_ARM_JOINT_INDICES)
+        elif target_mode == SimulationMode.RIGHT_SUSPENDED_ARMS:
+            active_indices = tuple(index for index in configured_arms if index in RIGHT_ARM_JOINT_INDICES)
+        else:
+            active_indices = configured_arms
+
+        if self.simulation_mode in suspended_modes:
+            state = loop.robot.get_state()
+            held = np.asarray(state.qpos, dtype=np.float32).reshape(-1)
+            if held.size < loop._num_actions or not np.all(np.isfinite(held[: loop._num_actions])):
+                raise ValueError("Robot state has invalid joint positions during suspended arm switch")
+            if self._suspended_hold_joint_pos is None:
+                raise RuntimeError("Suspended arm mode has no captured joint positions")
+            new_hold = self._suspended_hold_joint_pos.copy()
+            newly_inactive = tuple(set(self._active_suspended_arm_indices) - set(active_indices))
+            new_hold[list(newly_inactive)] = held[list(newly_inactive)]
+            self._suspended_hold_joint_pos = new_hold
+            self._active_suspended_arm_indices = active_indices
+            self.simulation_mode = target_mode
+            return True
+
         if not loop._realtime_input_has_frame(self._input_provider):
             return False
         packet = loop._fetch_realtime_input_packet(self._input_provider, self.last_live_packet_seq)
         frame_age_s = time.monotonic() - float(packet.timestamp_s)
         if not np.isfinite(frame_age_s) or frame_age_s < -0.05 or frame_age_s > 0.25:
-            _logger.warning("Cannot enter SUSPENDED_ARMS: Pico frame is not fresh (age %.3fs)", frame_age_s)
+            _logger.warning("Cannot enter %s: Pico frame is not fresh (age %.3fs)", target_mode.value.upper(), frame_age_s)
             return False
         from_idle = self.simulation_mode == SimulationMode.IDLE
         if not self.enter_mocap_mode():
@@ -291,8 +328,9 @@ class SimLoopSession:
         state = loop.robot.get_state()
         self._suspended_hold_joint_pos = np.asarray(state.qpos, dtype=np.float32)[: loop._num_actions].copy()
         self._suspended_entry_from_idle = from_idle
+        self._active_suspended_arm_indices = active_indices
         loop._set_standing_reference(state)
-        self.simulation_mode = SimulationMode.SUSPENDED_ARMS
+        self.simulation_mode = target_mode
         return True
 
     def toggle_arms_mode(self) -> bool:
@@ -371,22 +409,58 @@ class SimLoopSession:
                         self._loop._console.key_feedback("Y", "mocap", result="MOCAP")
                     else:
                         self._loop._console.key_feedback("Y", "mocap", result="waiting for input")
-                elif key == "f":
-                    if self.enter_suspended_arms_mode():
-                        self._loop._console.key_feedback("F", "suspended arms", result="SUSPENDED_ARMS")
+                elif key in ("1", "2", "3"):
+                    target_mode = (
+                        SimulationMode.LEFT_SUSPENDED_ARMS if key == "1"
+                        else SimulationMode.RIGHT_SUSPENDED_ARMS if key == "2"
+                        else SimulationMode.SUSPENDED_ARMS
+                    )
+                    label = (
+                        "left suspended arms" if key == "1"
+                        else "right suspended arms" if key == "2"
+                        else "suspended arms"
+                    )
+                    if self.enter_suspended_arms_mode(target_mode):
+                        self._loop._console.key_feedback(key, label, result=target_mode.value.upper())
                     else:
-                        self._loop._console.key_feedback("F", "suspended arms", result="tracking not ready; press F again")
+                        self._loop._console.key_feedback(key, label, result=f"tracking not ready; press {key} again")
                 continue
-            if key == "f" and self.simulation_mode == SimulationMode.SUSPENDED_ARMS:
-                if getattr(self, "_suspended_entry_from_idle", False):
-                    self.enter_idle_mode()
-                    self._loop._console.key_feedback("F", "idle", result="IDLE")
-                else:
-                    self.enter_standing_mode()
-                    self._loop._console.key_feedback("F", "standing", result="STANDING")
-                continue
+            if self.simulation_mode in (
+                SimulationMode.SUSPENDED_ARMS,
+                SimulationMode.LEFT_SUSPENDED_ARMS,
+                SimulationMode.RIGHT_SUSPENDED_ARMS,
+            ):
+                if key in ("1", "2", "3"):
+                    target_mode = (
+                        SimulationMode.LEFT_SUSPENDED_ARMS if key == "1"
+                        else SimulationMode.RIGHT_SUSPENDED_ARMS if key == "2"
+                        else SimulationMode.SUSPENDED_ARMS
+                    )
+                    label = (
+                        "left suspended arms" if key == "1"
+                        else "right suspended arms" if key == "2"
+                        else "suspended arms"
+                    )
+                    if self.simulation_mode == target_mode:
+                        if getattr(self, "_suspended_entry_from_idle", False):
+                            self.enter_idle_mode()
+                            self._loop._console.key_feedback(key, "idle", result="IDLE")
+                        else:
+                            self.enter_standing_mode()
+                            self._loop._console.key_feedback(key, "standing", result="STANDING")
+                    else:
+                        self.enter_suspended_arms_mode(target_mode)
+                        self._loop._console.key_feedback(key, label, result=target_mode.value.upper())
+                    continue
             if key == "x":
-                if self.simulation_mode == SimulationMode.SUSPENDED_ARMS and getattr(self, "_suspended_entry_from_idle", False):
+                if (
+                    self.simulation_mode in (
+                        SimulationMode.SUSPENDED_ARMS,
+                        SimulationMode.LEFT_SUSPENDED_ARMS,
+                        SimulationMode.RIGHT_SUSPENDED_ARMS,
+                    )
+                    and getattr(self, "_suspended_entry_from_idle", False)
+                ):
                     self.enter_idle_mode()
                     self._loop._console.key_feedback("X", "idle", result="IDLE")
                 else:
@@ -618,7 +692,12 @@ class SimLoopSession:
                 self.cached_retargeted = self.latest_live_retargeted
 
         from teleopit.sim.loop import SimulationMode
-        if self.simulation_mode in (SimulationMode.ARMS, SimulationMode.SUSPENDED_ARMS):
+        if self.simulation_mode in (
+            SimulationMode.ARMS,
+            SimulationMode.SUSPENDED_ARMS,
+            SimulationMode.LEFT_SUSPENDED_ARMS,
+            SimulationMode.RIGHT_SUSPENDED_ARMS,
+        ):
             self.cached_retargeted = loop._compose_arm_reference(cast(Float64Array, self.cached_retargeted))
             if reference_window is not None:
                 assert loop._standing_qpos is not None
@@ -745,11 +824,16 @@ class SimLoopSession:
                     raise ValueError(f"Controller returned {action.shape[0]} actions, expected {loop._num_actions}")
 
                 target_dof_pos = self._step_runner.compute_target_dof_pos(action)
-                if self.simulation_mode == SimulationMode.SUSPENDED_ARMS:
+                if self.simulation_mode in (
+                    SimulationMode.SUSPENDED_ARMS,
+                    SimulationMode.LEFT_SUSPENDED_ARMS,
+                    SimulationMode.RIGHT_SUSPENDED_ARMS,
+                ):
                     if self._suspended_hold_joint_pos is None:
-                        raise RuntimeError("SUSPENDED_ARMS has no captured leg and waist positions")
+                        raise RuntimeError(f"{self.simulation_mode.value.upper()} has no captured leg and waist positions")
+                    active_indices = getattr(self, "_active_suspended_arm_indices", loop._arm_joint_indices)
                     action, target_dof_pos = hold_non_arm_joints(
-                        action, target_dof_pos, self._suspended_hold_joint_pos, loop._arm_joint_indices,
+                        action, target_dof_pos, self._suspended_hold_joint_pos, active_indices,
                     )
                 torque, final_state = self._step_runner.apply_control(target_dof_pos)
                 loop._publisher.publish(preparation.mimic_obs, action, final_state)
