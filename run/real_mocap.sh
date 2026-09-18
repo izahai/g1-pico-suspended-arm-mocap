@@ -10,10 +10,19 @@
 #                             the interface that owns 192.168.123.x)
 #   TELEOPIT_POLICY=<path>    ONNX policy (default ckpt/track_g1.onnx)
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
-PY="$HOME/miniconda3/envs/teleopit/bin/python"
-[ -x "$PY" ] || PY="$(command -v python)"
+PY=""
+for c in "$HOME/miniforge3/envs/teleopit/bin/python" \
+         "$HOME/miniconda3/envs/teleopit/bin/python" \
+         "$(command -v python3 || true)" \
+         "$(command -v python || true)"; do
+  if [ -n "$c" ] && [ -x "$c" ]; then PY="$c"; break; fi
+done
+if [ -z "$PY" ]; then
+  echo "ABORT: no Python interpreter found."
+  exit 1
+fi
 POLICY="${TELEOPIT_POLICY:-ckpt/track_g1.onnx}"
 
 # --- robot LAN interface ------------------------------------------------------
@@ -46,7 +55,7 @@ fi
 # old teleopit processes + the XRoboToolkit PC service (systemd USER unit that
 # squats TCP 63901)
 systemctl --user stop holosim-pcservice 2>/dev/null
-for p in $(pgrep -f "miniconda3/envs/teleopi[t]/bin/python"); do kill -9 "$p" 2>/dev/null; done
+for p in $(pgrep -f "mini.*3/envs/teleopi[t]/bin/python" || pgrep -f "[s]cripts/run/run_sim2real.py"); do kill -9 "$p" 2>/dev/null; done
 sleep 2
 
 LOG=/tmp/session_monitor/sim2real.log
