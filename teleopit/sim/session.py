@@ -33,7 +33,7 @@ from teleopit.sim.reference_utils import (
 )
 from teleopit.sim.realtime_utils import RealtimeReferenceDiagnostics, RealtimeReferenceManager
 from teleopit.sim.runtime_components import MotionPreparation
-from teleopit.runtime.arm_mocap import compose_arm_reference_window
+from teleopit.runtime.arm_mocap import compose_arm_reference_window, hold_non_arm_joints
 from teleopit.runtime.mocap_session import MocapSessionManager, MocapSessionState
 from teleopit.runtime.offline_playback import OfflinePlaybackController
 from teleopit.runtime.terminal_keyboard import TerminalKeyboardReader
@@ -191,6 +191,7 @@ class SimLoopSession:
         self.simulation_mode: SimulationMode = (
             SimulationMode.STANDING if self.realtime_keyboard_mode_enabled else SimulationMode.MOCAP
         )
+        self._suspended_hold_joint_pos: Float32Array | None = None
         if self.simulation_mode == SimulationMode.STANDING:
             loop._set_standing_reference(loop.robot.get_state())
 
@@ -244,6 +245,7 @@ class SimLoopSession:
         from teleopit.sim.loop import SimulationMode
         self.reset_policy_reference_state()
         self._loop._set_standing_reference(self._loop.robot.get_state())
+        self._suspended_hold_joint_pos = None
         self.simulation_mode = SimulationMode.STANDING
 
     def enter_mocap_mode(self) -> bool:
@@ -264,9 +266,29 @@ class SimLoopSession:
         self.simulation_mode = SimulationMode.MOCAP
         return True
 
+    def enter_suspended_arms_mode(self) -> bool:
+        from teleopit.sim.loop import SimulationMode
+        loop = self._loop
+        if not loop._realtime_input_has_frame(self._input_provider):
+            return False
+        packet = loop._fetch_realtime_input_packet(self._input_provider, self.last_live_packet_seq)
+        frame_age_s = time.monotonic() - float(packet.timestamp_s)
+        if not np.isfinite(frame_age_s) or frame_age_s < -0.05 or frame_age_s > 0.25:
+            _logger.warning("Cannot enter SUSPENDED_ARMS: Pico frame is not fresh (age %.3fs)", frame_age_s)
+            return False
+        if not self.enter_mocap_mode():
+            return False
+        state = loop.robot.get_state()
+        self._suspended_hold_joint_pos = np.asarray(state.qpos, dtype=np.float32)[: loop._num_actions].copy()
+        loop._set_standing_reference(state)
+        self.simulation_mode = SimulationMode.SUSPENDED_ARMS
+        return True
+
     def toggle_arms_mode(self) -> bool:
         from teleopit.sim.loop import SimulationMode
-        if not self.realtime_interpolated_input or self.simulation_mode not in (SimulationMode.MOCAP, SimulationMode.ARMS):
+        if not self.realtime_interpolated_input or self.simulation_mode not in (
+            SimulationMode.MOCAP, SimulationMode.ARMS, SimulationMode.SUSPENDED_ARMS,
+        ):
             return False
         if self.mocap_session.state == MocapSessionState.PAUSED:
             _logger.info("Ignoring arm-only mode toggle while mocap session is paused")
@@ -274,11 +296,12 @@ class SimLoopSession:
         loop = self._loop
         state = loop.robot.get_state()
         resume_qpos = loop._build_resume_alignment_qpos(self.last_commanded_motion_qpos, state)
-        if self.simulation_mode == SimulationMode.MOCAP:
+        if self.simulation_mode in (SimulationMode.MOCAP, SimulationMode.SUSPENDED_ARMS):
             loop._set_standing_reference(state)
             self.simulation_mode = SimulationMode.ARMS
         else:
             self.simulation_mode = SimulationMode.MOCAP
+        self._suspended_hold_joint_pos = None
         self._step_runner.reset()
         loop.controller.reset()
         loop.obs_builder.reset()
@@ -334,6 +357,15 @@ class SimLoopSession:
                         self._loop._console.key_feedback("Y", "mocap", result="MOCAP")
                     else:
                         self._loop._console.key_feedback("Y", "mocap", result="waiting for input")
+                elif key == "f":
+                    if self.enter_suspended_arms_mode():
+                        self._loop._console.key_feedback("F", "suspended arms", result="SUSPENDED_ARMS")
+                    else:
+                        self._loop._console.key_feedback("F", "suspended arms", result="tracking not ready; press F again")
+                continue
+            if key == "f" and self.simulation_mode == SimulationMode.SUSPENDED_ARMS:
+                self.enter_standing_mode()
+                self._loop._console.key_feedback("F", "standing", result="STANDING")
                 continue
             if key == "x":
                 self.enter_standing_mode()
@@ -564,7 +596,7 @@ class SimLoopSession:
                 self.cached_retargeted = self.latest_live_retargeted
 
         from teleopit.sim.loop import SimulationMode
-        if self.simulation_mode == SimulationMode.ARMS:
+        if self.simulation_mode in (SimulationMode.ARMS, SimulationMode.SUSPENDED_ARMS):
             self.cached_retargeted = loop._compose_arm_reference(cast(Float64Array, self.cached_retargeted))
             if reference_window is not None:
                 assert loop._standing_qpos is not None
@@ -691,6 +723,12 @@ class SimLoopSession:
                     raise ValueError(f"Controller returned {action.shape[0]} actions, expected {loop._num_actions}")
 
                 target_dof_pos = self._step_runner.compute_target_dof_pos(action)
+                if self.simulation_mode == SimulationMode.SUSPENDED_ARMS:
+                    if self._suspended_hold_joint_pos is None:
+                        raise RuntimeError("SUSPENDED_ARMS has no captured leg and waist positions")
+                    action, target_dof_pos = hold_non_arm_joints(
+                        action, target_dof_pos, self._suspended_hold_joint_pos, loop._arm_joint_indices,
+                    )
                 torque, final_state = self._step_runner.apply_control(target_dof_pos)
                 loop._publisher.publish(preparation.mimic_obs, action, final_state)
                 self._viewer_manager.write_sim2sim(loop.robot)

@@ -11,7 +11,7 @@
 #
 # SDK-side damping (LocoClient.Damp) does NOT work while a bridge holds the
 # robot (three "DAMP UNCONFIRMED" events on record) - it is not attempted here.
-for p in $(pgrep -f "miniconda3/envs/teleopi[t]/bin/python"); do
+for p in $(pgrep -f "mini.*3/envs/teleopi[t]/bin/python" || pgrep -f "[s]cripts/run/run_sim2real.py"); do
   kill -9 "$p" 2>/dev/null
 done
 # also stop an onboard session if the Orin is reachable (best effort, 3 s)

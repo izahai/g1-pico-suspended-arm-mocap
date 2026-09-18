@@ -44,6 +44,7 @@ from teleopit.runtime.factory import _build_policy_components, build_simulation_
 from teleopit.runtime.arm_mocap import (
     compose_arm_reference,
     compose_arm_reference_window,
+    hold_non_arm_joints,
     parse_arm_joint_indices,
 )
 from teleopit.runtime.mocap_session import MocapSessionManager, MocapSessionState
@@ -146,6 +147,7 @@ class RobotMode(Enum):
     STANDING = "standing"
     MOCAP = "mocap"
     ARMS = "arms"
+    SUSPENDED_ARMS = "suspended_arms"
     JOYSTICK = "joystick"
     POLICY = "policy"
     DAMPING = "damping"
@@ -486,13 +488,16 @@ class Sim2RealRuntime:
         operator_logger.info("runtime starting")
         try:
             self._start_processes()
-            if _recording_enabled(self.cfg):
+            if _recording_enabled(self.cfg) or (
+                _input_provider_kind(self.cfg) == "pico4" and sys.stdin.isatty()
+            ):
                 self._command_pub = ZmqPublisher(self._endpoints.command_pub)
                 self._keyboard = TerminalKeyboardReader()
-                operator_logger.info("keyboard recording controls active: R start, S save, D discard, Q shutdown, H help")
+                if self._keyboard.active:
+                    operator_logger.info("terminal keyboard controls active; press H for help")
             reported_noncritical_dead: set[str] = set()
             while not self._stop_event.is_set():
-                self._poll_terminal_recording_controls()
+                self._poll_terminal_controls()
                 time.sleep(0.2)
                 critical_names = {"robot_control", "reference"}
                 critical_dead = [
@@ -579,7 +584,7 @@ class Sim2RealRuntime:
             process.start()
             self._processes.append(process)
 
-    def _poll_terminal_recording_controls(self) -> None:
+    def _poll_terminal_controls(self) -> None:
         if self._keyboard is None or self._command_pub is None:
             return
         events = self._keyboard.poll()
@@ -590,11 +595,16 @@ class Sim2RealRuntime:
             if normalized == "h":
                 self._console.help(self._console_controls)
                 continue
-            command = map_recording_key_to_command(event.key)
+            command = (
+                "toggle_suspended_arms"
+                if normalized == "f" and _input_provider_kind(self.cfg) == "pico4"
+                else map_recording_key_to_command(event.key) if _recording_enabled(self.cfg) else None
+            )
             if command is None:
                 continue
             self._command_pub.publish(COMMAND_TOPIC, CommandPacket(command=command, timestamp_s=time.monotonic()))
-            self._console.key_feedback(str(event.key).upper(), _recording_command_label(command))
+            label = "toggle suspended arms" if command == "toggle_suspended_arms" else _recording_command_label(command)
+            self._console.key_feedback(str(event.key).upper(), label)
             if command == "shutdown":
                 self._stop_event.set()
 
@@ -1273,6 +1283,9 @@ class _RobotControlWorker:
         self._last_mocap_hold_reason: str | None = None
         self._mocap_reentry_armed = False
         self._mocap_entry_requested = False
+        self._suspended_entry_requested = False
+        self._suspended_entry_deadline_s: float | None = None
+        self._suspended_hold_joint_pos: Float32Array | None = None
         self._mocap_reference_armed = False
         self._mocap_reference_arm_time_s: float | None = None
         self._mocap_reference_arm_retry_s = float(cfg_get(_mp_cfg(cfg), "mocap_reference_arm_retry_s", 0.1))
@@ -1418,7 +1431,7 @@ class _RobotControlWorker:
                     self._handle_transitions()
                     if self.mode == RobotMode.STANDING:
                         self._standing_step()
-                    elif self.mode in (RobotMode.MOCAP, RobotMode.ARMS):
+                    elif self.mode in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS):
                         self._mocap_step()
                     elif self.mode == RobotMode.JOYSTICK:
                         self._joystick_step()
@@ -1440,7 +1453,7 @@ class _RobotControlWorker:
     def shutdown(self) -> None:
         if self.high_level_policy_enabled and self._policy_session_id is not None:
             self._stop_high_level_policy_session()
-        if self.mode in (RobotMode.STANDING, RobotMode.MOCAP, RobotMode.ARMS, RobotMode.POLICY):
+        if self.mode in (RobotMode.STANDING, RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS, RobotMode.POLICY):
             try:
                 self.robot.set_damping()
                 time.sleep(0.5)
@@ -1492,6 +1505,8 @@ class _RobotControlWorker:
         if isinstance(command, CommandPacket) and command.command == "shutdown":
             self.stop_event.set()
             return
+        if isinstance(command, CommandPacket) and command.command == "toggle_suspended_arms":
+            self._toggle_suspended_arms_mode()
         if isinstance(command, CommandPacket) and command.command == HIGH_LEVEL_POLICY_FAULT_COMMAND:
             detail = str(
                 command.payload.get(
@@ -1538,9 +1553,27 @@ class _RobotControlWorker:
                     operator_logger.info(
                         "settled in STANDING -- ALIGN YOUR BODY to the robot, then press Y for teleop"
                     )
+            if (
+                getattr(self, "_suspended_entry_requested", False)
+                and bool(getattr(getattr(self.remote, "X", None), "on_pressed", False))
+            ):
+                self._cancel_suspended_entry()
+                operator_logger.info("X -> suspended arms entry cancelled; remaining in STANDING")
+                return
             reentry_request = self._mocap_reentry_armed and self.remote.Y.pressed
             if self.remote.Y.on_pressed or reentry_request:
+                self._suspended_entry_requested = False
+                self._suspended_entry_deadline_s = None
                 self._mocap_entry_requested = True
+            if getattr(self, "_suspended_entry_requested", False):
+                self._arm_mocap_reference_if_needed()
+                if self._can_switch_to_mocap():
+                    self._transition_to_suspended_arms()
+                    return
+                deadline_s = self._suspended_entry_deadline_s
+                if deadline_s is not None and time.monotonic() >= deadline_s:
+                    self._cancel_suspended_entry()
+                    operator_logger.warning("F -> Pico tracking not ready; remaining in STANDING")
             if self._mocap_entry_requested:
                 self._arm_mocap_reference_if_needed()
                 if self._can_switch_to_mocap():
@@ -1550,7 +1583,7 @@ class _RobotControlWorker:
                     operator_logger.warning(
                         "Y -> no body tracking data (wake the ankle trackers / check PicoBridge), holding STANDING"
                     )
-        elif self.mode in (RobotMode.MOCAP, RobotMode.ARMS):
+        elif self.mode in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS):
             if self.provider_kind == "bvh" and self.remote.B.on_pressed:
                 operator_logger.info("B -> replay BVH from frame 0")
                 self._send_reference_command("replay_mocap")
@@ -2298,7 +2331,7 @@ class _RobotControlWorker:
             robot_state,
             reference_window=reference_window,
             align_reference=True,
-            compose_arms=self.mode == RobotMode.ARMS,
+            compose_arms=self.mode in (RobotMode.ARMS, RobotMode.SUSPENDED_ARMS),
         )
 
     def _execute_reference_pipeline(
@@ -2354,7 +2387,14 @@ class _RobotControlWorker:
         )
         obs = self._ref_proc.validate_observation(obs)
         action = self.policy.compute_action(obs)
-        target_dof_pos = self._safety.clip_to_joint_limits(self.policy.get_target_dof_pos(action))
+        target_dof_pos = self.policy.get_target_dof_pos(action)
+        if self.mode == RobotMode.SUSPENDED_ARMS:
+            if self._suspended_hold_joint_pos is None:
+                raise RuntimeError("SUSPENDED_ARMS has no captured leg and waist positions")
+            action, target_dof_pos = hold_non_arm_joints(
+                action, target_dof_pos, self._suspended_hold_joint_pos, self._arm_joint_indices,
+            )
+        target_dof_pos = self._safety.clip_to_joint_limits(target_dof_pos)
         self._safety.send_positions(target_dof_pos)
         self._last_action = np.asarray(action, dtype=np.float32).reshape(-1)
         self._last_retarget_qpos = qpos.copy()
@@ -2389,12 +2429,16 @@ class _RobotControlWorker:
         self._disarm_mocap_reference_if_needed()
         self._clear_reference_gate()
         self._mocap_entry_requested = False
+        self._suspended_entry_requested = False
+        self._suspended_entry_deadline_s = None
+        self._suspended_hold_joint_pos = None
         if prev_mode == RobotMode.STANDING:
             return
         already_in_debug = self.mode in (
             RobotMode.STANDING,
             RobotMode.MOCAP,
             RobotMode.ARMS,
+            RobotMode.SUSPENDED_ARMS,
             RobotMode.POLICY,
         )
         if not already_in_debug:
@@ -2410,6 +2454,7 @@ class _RobotControlWorker:
             RobotMode.STANDING,
             RobotMode.MOCAP,
             RobotMode.ARMS,
+            RobotMode.SUSPENDED_ARMS,
             RobotMode.POLICY,
         ):
             logger.info("Locking joints to current position...")
@@ -2426,6 +2471,7 @@ class _RobotControlWorker:
         if prev_mode in (
             RobotMode.MOCAP,
             RobotMode.ARMS,
+            RobotMode.SUSPENDED_ARMS,
             RobotMode.POLICY,
         ):
             self._safety.start_kp_ramp(
@@ -2459,12 +2505,17 @@ class _RobotControlWorker:
             return False
         return True
 
-    def _transition_to_mocap(self) -> None:
+    def _transition_to_mocap(
+        self,
+        *,
+        entry_mode: RobotMode = RobotMode.MOCAP,
+        entry_state: object | None = None,
+    ) -> None:
         # 2026-08-17: joint blend-in over mocap_entry_blend_s — entry was a
         # hard snap to the pilot's pose, which falls whenever the pilot is not
         # perfectly aligned (worst after joystick sessions).
         self._mocap_blend_start_s = time.monotonic()
-        state = self.robot.get_state()
+        state = self.robot.get_state() if entry_state is None else entry_state
         last_commanded = getattr(self, "_last_commanded_motion_qpos", None)
         hold_qpos = last_commanded if last_commanded is not None else self._standing_qpos
         resume_qpos = self._build_resume_alignment_qpos(hold_qpos, state)
@@ -2475,12 +2526,64 @@ class _RobotControlWorker:
         self._ref_proc.reset_alignment(target_qpos=resume_qpos)
         if self.provider_kind == "bvh":
             self._send_reference_command("replay_mocap")
-        self.mode = RobotMode.MOCAP
+        self.mode = entry_mode
         self._mocap_entry_requested = False
-        operator_logger.info("mode -> MOCAP")
+        operator_logger.info("mode -> %s", entry_mode.value.upper())
+
+    def _toggle_suspended_arms_mode(self) -> None:
+        if self.provider_kind != "pico4" or self.high_level_policy_enabled:
+            return
+        if self.mode == RobotMode.SUSPENDED_ARMS:
+            self._enter_standing()
+            return
+        if self.mode != RobotMode.STANDING:
+            operator_logger.info("F ignored in %s; enter SUSPENDED_ARMS from STANDING", self.mode.value.upper())
+            return
+        if getattr(self, "_pending_after_settle", None) is not None:
+            operator_logger.info("F ignored while waiting for joystick transition to settle")
+            return
+        if self._suspended_entry_requested:
+            self._cancel_suspended_entry()
+            operator_logger.info("F -> suspended arms entry cancelled")
+            return
+        self._mocap_entry_requested = False
+        self._suspended_entry_requested = True
+        self._suspended_entry_deadline_s = time.monotonic() + 2.0
+        self._arm_mocap_reference_if_needed()
+        operator_logger.info("F -> validating Pico tracking for SUSPENDED_ARMS")
+
+    def _cancel_suspended_entry(self) -> None:
+        self._suspended_entry_requested = False
+        self._suspended_entry_deadline_s = None
+        if not self._mocap_entry_requested:
+            self._disarm_mocap_reference_if_needed()
+            self._clear_reference_gate()
+
+    def _transition_to_suspended_arms(self) -> None:
+        state = self.robot.get_state()
+        held = np.asarray(getattr(state, "qpos"), dtype=np.float32).reshape(-1)
+        if held.shape[0] < self.num_actions:
+            raise ValueError(f"Robot state has {held.shape[0]} joints; need {self.num_actions}")
+        if not np.all(np.isfinite(held[: self.num_actions])):
+            raise ValueError("Robot state has non-finite joint positions on SUSPENDED_ARMS entry")
+        non_arm_mask = np.ones(self.num_actions, dtype=bool)
+        non_arm_mask[self._arm_joint_indices] = False
+        safe_held = self._safety.clip_to_joint_limits(held[: self.num_actions])
+        if np.any(np.abs(safe_held[non_arm_mask] - held[: self.num_actions][non_arm_mask]) > 1e-4):
+            self._cancel_suspended_entry()
+            operator_logger.warning("F -> non-arm joint outside configured limits; remaining in STANDING")
+            return
+        self._suspended_hold_joint_pos = held[: self.num_actions].copy()
+        self._transition_to_mocap(entry_mode=RobotMode.SUSPENDED_ARMS, entry_state=state)
+        self._set_default_standing_reference(state)
+        self._suspended_entry_requested = False
+        self._suspended_entry_deadline_s = None
+        operator_logger.info("SUSPENDED_ARMS holds legs and waist at measured entry angles")
 
     def _toggle_arms_mode(self) -> None:
-        if self.provider_kind != "pico4" or self.mode not in (RobotMode.MOCAP, RobotMode.ARMS):
+        if self.provider_kind != "pico4" or self.mode not in (
+            RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS,
+        ):
             return
         if self._mocap_session.state == MocapSessionState.PAUSED:
             logger.info("Ignoring Pico B mode toggle while mocap session is paused")
@@ -2488,7 +2591,7 @@ class _RobotControlWorker:
 
         state = self.robot.get_state()
         resume_qpos = self._build_resume_alignment_qpos(self._last_commanded_motion_qpos, state)
-        next_mode = RobotMode.ARMS if self.mode == RobotMode.MOCAP else RobotMode.MOCAP
+        next_mode = RobotMode.MOCAP if self.mode == RobotMode.ARMS else RobotMode.ARMS
         if next_mode == RobotMode.ARMS:
             self._set_default_standing_reference(state)
         self._reset_policy_state()
@@ -2500,6 +2603,7 @@ class _RobotControlWorker:
             floor_ratio=self._standing_return_kp_ramp_floor_ratio,
         )
         self.mode = next_mode
+        self._suspended_hold_joint_pos = None
         operator_logger.info("mode -> %s", next_mode.value.upper())
 
     def _resume_paused_mocap_if_needed(self) -> None:
@@ -2514,13 +2618,14 @@ class _RobotControlWorker:
         self._disarm_mocap_reference_if_needed()
         self._clear_reference_gate()
         self._mocap_entry_requested = False
-        if self.mode in (RobotMode.STANDING, RobotMode.MOCAP, RobotMode.ARMS, RobotMode.POLICY):
+        if self.mode in (RobotMode.STANDING, RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS, RobotMode.POLICY):
             logger.info("DAMPING: sending LowCmd damping...")
             self.robot.set_damping()
             time.sleep(0.5)
             logger.info("DAMPING: exiting debug mode...")
         self.robot.exit_debug_mode()
         self.mode = RobotMode.DAMPING
+        self._suspended_hold_joint_pos = None
         self._publish_damping_record_step()
         self._ref_proc.last_reference_qpos = None
         self._mocap_reentry_armed = False
@@ -2592,7 +2697,7 @@ class _RobotControlWorker:
                 self._toggle_arms_mode()
                 continue
             if event.event_type == ControlEventType.TOGGLE_PAUSE:
-                if self.mode not in (RobotMode.MOCAP, RobotMode.ARMS):
+                if self.mode not in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS):
                     continue
                 if self._mocap_session.state == MocapSessionState.PAUSED:
                     self._resume_paused_mocap()
@@ -2619,7 +2724,7 @@ class _RobotControlWorker:
         self._last_retarget_qpos = None
         self._last_commanded_motion_qpos = resume_qpos.copy()
         self._ref_proc.reset_alignment(target_qpos=resume_qpos)
-        if self.mode == RobotMode.ARMS:
+        if self.mode in (RobotMode.ARMS, RobotMode.SUSPENDED_ARMS):
             self._set_default_standing_reference(state)
             self._safety.start_kp_ramp(
                 duration_s=self._standing_return_ramp_duration,
@@ -2700,7 +2805,14 @@ class _RobotControlWorker:
         )
         obs = self._ref_proc.validate_observation(obs)
         action = self.policy.compute_action(obs)
-        target_dof_pos = self._safety.clip_to_joint_limits(self.policy.get_target_dof_pos(action))
+        target_dof_pos = self.policy.get_target_dof_pos(action)
+        if self.mode == RobotMode.SUSPENDED_ARMS:
+            if self._suspended_hold_joint_pos is None:
+                raise RuntimeError("SUSPENDED_ARMS has no captured leg and waist positions")
+            action, target_dof_pos = hold_non_arm_joints(
+                action, target_dof_pos, self._suspended_hold_joint_pos, self._arm_joint_indices,
+            )
+        target_dof_pos = self._safety.clip_to_joint_limits(target_dof_pos)
         self._safety.send_positions(target_dof_pos)
         self._last_action = np.asarray(action, dtype=np.float32).reshape(-1)
         self._last_retarget_qpos = qpos.copy()
@@ -2720,7 +2832,7 @@ class _RobotControlWorker:
 
     def _publish_mode_state(self) -> None:
         self._mode_seq += 1
-        mocap_like = self.mode in (RobotMode.MOCAP, RobotMode.ARMS)
+        mocap_like = self.mode in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS)
         active = mocap_like and self._mocap_session.state == MocapSessionState.ACTIVE
         paused = mocap_like and self._mocap_session.state == MocapSessionState.PAUSED
         self._mode_pub.publish(
@@ -2742,9 +2854,9 @@ class _RobotControlWorker:
         if self._record_pub is None:
             return
         record_mode = self._recording_mode_label()
-        mocap_like = self.mode in (RobotMode.MOCAP, RobotMode.ARMS)
+        mocap_like = self.mode in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS)
         active = mocap_like and self._mocap_session.state == MocapSessionState.ACTIVE
-        recordable = self.mode != RobotMode.DAMPING
+        recordable = self.mode not in (RobotMode.DAMPING, RobotMode.SUSPENDED_ARMS)
         try:
             self._record_pub.publish(
                 RECORD_TOPIC,
@@ -2754,7 +2866,10 @@ class _RobotControlWorker:
                     mocap_active=active,
                     recordable=recordable,
                     observation_state=build_observation_state(robot_state).astype(np.float32, copy=True),
-                    observation_mode=int(build_mode_observation(record_mode)),
+                    observation_mode=(
+                        -1 if self.mode == RobotMode.SUSPENDED_ARMS
+                        else int(build_mode_observation(record_mode))
+                    ),
                     action_reference_qpos=normalize_action_reference_qpos(reference_qpos).astype(np.float32, copy=True),
                     seq=self._mode_seq,
                 ),
@@ -2786,7 +2901,7 @@ class _RobotControlWorker:
 
     def _recording_mode_label(self) -> str:
         if (
-            self.mode in (RobotMode.MOCAP, RobotMode.ARMS)
+            self.mode in (RobotMode.MOCAP, RobotMode.ARMS, RobotMode.SUSPENDED_ARMS)
             and self._mocap_session.state == MocapSessionState.PAUSED
         ):
             return "pause"

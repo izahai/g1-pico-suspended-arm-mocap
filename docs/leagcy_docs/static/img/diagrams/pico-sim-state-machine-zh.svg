@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
   <title id="title">Pico 仿真控制状态机</title>
-  <desc id="desc">键盘 Y 开始实时会话，键盘或 Pico 手柄 B 切换全身与仅手臂控制，键盘或 Pico 手柄 A 暂停，键盘 X 返回站立，键盘 Q 退出。</desc>
+  <desc id="desc">键盘 Y 开始实时会话，键盘 F 从站立切换悬吊双臂模式，键盘或 Pico 手柄 B 切换全身与仅手臂控制，键盘或 Pico 手柄 A 暂停，键盘 X 返回站立，键盘 Q 退出。</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 Z" fill="#475569"/>
@@ -35,6 +35,10 @@
   <text x="181" y="263" class="state-title" text-anchor="middle">STANDING</text>
   <text x="181" y="291" class="state-copy" text-anchor="middle">站立姿态 · 实时追踪未接管</text>
 
+  <rect x="62" y="414" width="238" height="100" rx="18" fill="#fae8ff" stroke="#a21caf" stroke-width="2.5"/>
+  <text x="181" y="452" class="state-title" text-anchor="middle" style="font-size:18px">SUSPENDED_ARMS</text>
+  <text x="181" y="482" class="state-copy" text-anchor="middle">腿腰保持 · 双臂跟随</text>
+
   <rect x="430" y="158" width="230" height="98" rx="18" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
   <circle cx="459" cy="184" r="8" fill="#16a34a"/>
   <text x="545" y="200" class="state-title" text-anchor="middle">MOCAP</text>
@@ -53,6 +57,10 @@
   <path d="M300 248 C345 248 370 207 430 207" class="arrow"/>
   <rect x="292" y="172" width="115" height="28" rx="14" fill="#dbeafe"/>
   <text x="349" y="191" class="label" text-anchor="middle">键盘 Y</text>
+
+  <path d="M181 324 L181 414" class="both"/>
+  <rect x="113" y="349" width="136" height="28" rx="14" fill="#dbeafe"/>
+  <text x="181" y="368" class="label" text-anchor="middle">键盘 F</text>
 
   <path d="M390 311 C354 311 337 292 300 292" class="arrow"/>
   <rect x="301" y="329" width="153" height="28" rx="14" fill="#dbeafe"/>

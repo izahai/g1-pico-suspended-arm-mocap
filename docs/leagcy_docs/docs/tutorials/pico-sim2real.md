@@ -108,8 +108,9 @@ Starting the program does not immediately give Pico control of the robot.
 ![Pico G1 control state machine](/img/diagrams/pico-g1-state-machine.svg)
 
 Labels beginning with **G1 remote** refer to the Unitree remote. Labels
-beginning with **Pico controller** refer to the VR controllers. The computer
-keyboard does not switch robot modes.
+beginning with **Pico controller** refer to the VR controllers. In the
+interactive Teleopit terminal, **F** enters `SUSPENDED_ARMS` from `STANDING`
+and returns to `STANDING` on the next press.
 
 Press **G1 remote** `Start` to enter `STANDING`. Wait until the robot is stable,
 stand in a neutral pose and make sure Pico tracking is valid. Then press
@@ -118,7 +119,17 @@ stand in a neutral pose and make sure Pico tracking is valid. Then press
 
 `MOCAP` follows the whole body. `ARMS` keeps the body, waist and legs in the
 standing pose while both arms continue to follow. `PAUSED` holds the current
-reference; resuming returns to the previous `MOCAP` or `ARMS` state.
+reference; resuming returns to the previous active mode.
+
+`SUSPENDED_ARMS` uses the same live arm reference as `ARMS`, but holds the legs
+and waist at their measured angles from entry with PD position control. The
+policy's non-arm outputs are not sent to those joints. Press **F** only from
+`STANDING`; entry waits up to two seconds for valid Pico frames, then cancels
+if none arrive. Press **F** again after tracking recovers. While active, Pico
+controller `B` switches to regular `ARMS`, restoring full-body policy output.
+G1 remote `B` or Pico controller `A` pauses and resumes arm tracking. G1 remote
+`X` returns to `STANDING`, where normal full-body policy output resumes.
+`SUSPENDED_ARMS` cannot be recorded; entering it discards an active episode.
 
 Teleopit checks several consecutive Pico frames before entering `MOCAP`. If
 that check fails, the robot stays in `STANDING`.

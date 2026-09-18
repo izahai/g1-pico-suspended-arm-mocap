@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # One-command Teleopit session launcher (laptop side).
-#   bash ~/Teleopit/go.sh
-# Cleans stale processes/ports, starts sim2real, waits for "robot control ready".
-# The PicoBridge headset app connects BY ITSELF ~5 s after this prints READY
+#   bash run/real_mocap.sh                 # background session
+#   bash run/real_mocap.sh --interactive   # keep keyboard controls attached
+# Cleans stale processes/ports and starts sim2real. Background mode waits for
+# "robot control ready"; interactive mode runs until Teleopit exits.
+# The PicoBridge headset app connects BY ITSELF ~5 s after robot control is ready
 # (via the discovery relay on the Orin, see lab/orin/README.md).
 #
 # Env overrides:
@@ -10,7 +12,24 @@
 #                             the interface that owns 192.168.123.x)
 #   TELEOPIT_POLICY=<path>    ONNX policy (default ckpt/track_g1.onnx)
 set -u
+if [ "$#" -gt 1 ]; then
+  echo "Usage: bash run/real_mocap.sh [--interactive]" >&2
+  exit 2
+fi
+INTERACTIVE=0
+case "${1:-}" in
+  "") ;;
+  --interactive|-i) INTERACTIVE=1 ;;
+  *) echo "Usage: bash run/real_mocap.sh [--interactive]" >&2; exit 2 ;;
+esac
+if [ "$INTERACTIVE" -eq 1 ] && [ ! -t 0 ]; then
+  echo "ABORT: --interactive requires a terminal for F keyboard control." >&2
+  exit 1
+fi
 cd "$(dirname "$0")/.."
+# The teleopit environment may be editable-installed from another checkout.
+# Always load this launcher's code and config together.
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 PY=""
 for c in "$HOME/miniforge3/envs/teleopit/bin/python" \
@@ -60,12 +79,16 @@ sleep 2
 
 LOG=/tmp/session_monitor/sim2real.log
 mkdir -p /tmp/session_monitor
-echo "interface=$IFACE  policy=$POLICY  log=$LOG"
-setsid nohup "$PY" -u scripts/run/run_sim2real.py \
+CMD=("$PY" -u scripts/run/run_sim2real.py \
     --config-name pico4_sim2real \
     controller.policy_path="$POLICY" \
-    real_robot.network_interface="$IFACE" \
-    > "$LOG" 2>&1 < /dev/null &
+    real_robot.network_interface="$IFACE")
+if [ "$INTERACTIVE" -eq 1 ]; then
+  echo "interface=$IFACE  policy=$POLICY  interactive terminal controls: F=suspended arms, H=help"
+  exec "${CMD[@]}"
+fi
+echo "interface=$IFACE  policy=$POLICY  log=$LOG"
+setsid nohup "${CMD[@]}" > "$LOG" 2>&1 < /dev/null &
 
 for i in $(seq 1 30); do
   sleep 1

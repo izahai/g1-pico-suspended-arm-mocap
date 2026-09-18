@@ -101,15 +101,24 @@ python scripts/run/run_sim2real.py \
 
 ![Pico G1 控制状态机](/img/diagrams/pico-g1-state-machine-zh.svg)
 
-图中的 **G1 遥控器**表示 Unitree 遥控器，**Pico 手柄**表示 VR 手柄。电脑键盘不负责
-切换真机状态。
+图中的 **G1 遥控器**表示 Unitree 遥控器，**Pico 手柄**表示 VR 手柄。在运行
+Teleopit 的交互式终端中，按 **F** 可从 `STANDING` 进入 `SUSPENDED_ARMS`，
+再次按 **F** 返回 `STANDING`。
 
 先按 **G1 遥控器** `Start` 进入 `STANDING`。等机器人站稳，以中立姿态站好，并确认
 Pico 追踪有效。然后按 **G1 遥控器** `Y` 进入 `MOCAP`，从缓慢的小幅动作开始。需要
 结束 VR 会话时，按 **G1 遥控器** `X` 返回 `STANDING`。
 
 `MOCAP` 控制全身。`ARMS` 会让身体、腰和腿保持站立，只有双臂继续跟随。
-`PAUSED` 保持当前参考姿态，恢复后回到暂停前的 `MOCAP` 或 `ARMS`。
+`PAUSED` 保持当前参考姿态，恢复后回到暂停前的活动模式。
+
+`SUSPENDED_ARMS` 使用与 `ARMS` 相同的实时双臂参考，但通过 PD 位置控制将腿部和
+腰部保持在进入模式时测得的关节角度。策略输出中的非手臂部分不会发送给这些关节。
+仅在 `STANDING` 中按 **F** 进入；系统最多等待两秒以获取有效的 Pico 帧，超时后
+取消进入。追踪恢复后需再次按 **F**。在此模式中，按 Pico 手柄 `B` 会切换到普通
+`ARMS`，恢复全身策略输出。G1 遥控器 `B` 或 Pico 手柄 `A` 可暂停或恢复手臂追踪。
+按 G1 遥控器 `X` 返回 `STANDING` 后，正常的全身策略输出会恢复。`SUSPENDED_ARMS`
+不可录制；进入该模式会丢弃正在录制的 episode。
 
 进入 `MOCAP` 前，Teleopit 会连续检查多帧 Pico 数据。检查没有通过时，机器人会继续
 停留在 `STANDING`。

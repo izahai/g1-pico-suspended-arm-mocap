@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import time
 
 from conftest import requires_mujoco
 from teleopit.bus.in_process import InProcessBus
@@ -799,6 +800,89 @@ def test_simulation_loop_pico_arms_mode_composes_standing_body_with_live_arm(mon
 
 
 @requires_mujoco
+@pytest.mark.parametrize("exit_control", ["f", "b"])
+def test_suspended_arms_holds_non_arm_targets_until_exit(monkeypatch, exit_control: str) -> None:
+    from teleopit.sim.loop import SimulationLoop
+
+    class _RealtimeInputProvider:
+        fps = 50
+
+        def __init__(self) -> None:
+            self.seq = -1
+
+        def has_frame(self) -> bool:
+            return True
+
+        def pop_control_events(self):
+            return ()
+
+        def get_realtime_input_packet(self):
+            self.seq += 1
+            return RealtimeInputPacket(
+                frame={"Pelvis": (
+                    np.zeros(3, dtype=np.float32),
+                    np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                )},
+                timestamp_s=time.monotonic(),
+                seq=self.seq,
+                control_events=(
+                    (ControlEvent(event_type=ControlEventType.TOGGLE_ARMS, source="pico4:test"),)
+                    if exit_control == "b" and self.seq == 3 else ()
+                ),
+            )
+
+    class _KeyboardReader:
+        def __init__(self) -> None:
+            exit_events = (TerminalKeyEvent("f"),) if exit_control == "f" else ()
+            self.polls = iter(((TerminalKeyEvent("f"),), (), exit_events))
+
+        @property
+        def active(self) -> bool:
+            return True
+
+        def poll(self):
+            return next(self.polls, ())
+
+        def close(self) -> None:
+            pass
+
+    class _Robot(_DummyRobot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.torques: list[np.ndarray] = []
+
+        def set_action(self, action: np.ndarray) -> None:
+            self.torques.append(np.asarray(action, dtype=np.float32).copy())
+            super().set_action(action)
+
+    monkeypatch.setattr("teleopit.sim.session.TerminalKeyboardReader", _KeyboardReader)
+    robot = _Robot()
+    loop = SimulationLoop(
+        robot=robot,
+        controller=_DummyController(),
+        obs_builder=_DummyObsBuilder(),
+        bus=InProcessBus(),
+        cfg={
+            "policy_hz": 50.0,
+            "pd_hz": 50.0,
+            "realtime": False,
+            "retarget_buffer_enabled": False,
+            "keyboard": {"enabled": True},
+            "arm_mocap": {"controlled_joint_indices": [1]},
+        },
+        viewers=set(),
+    )
+
+    result = loop.run(input_provider=_RealtimeInputProvider(), retargeter=_DummyRetargeter(), num_steps=3)
+
+    assert result["steps"] == 3
+    assert len(robot.torques) == 3
+    np.testing.assert_allclose([robot.torques[0][0], robot.torques[1][0]], [0.0, 0.0], atol=1e-6)
+    assert robot.torques[0][1] != 0.0
+    assert robot.torques[2][0] != 0.0
+
+
+@requires_mujoco
 def test_simulation_loop_realtime_keyboard_mode_drains_stale_pause_events(monkeypatch) -> None:
     from teleopit.sim.loop import SimulationLoop
 
@@ -898,7 +982,8 @@ def test_simulation_loop_realtime_keyboard_mode_drains_stale_pause_events(monkey
 
 
 @requires_mujoco
-def test_simulation_loop_realtime_keyboard_mode_keeps_standing_when_input_not_ready(monkeypatch) -> None:
+@pytest.mark.parametrize("entry_key", ["y", "f"])
+def test_simulation_loop_realtime_keyboard_mode_keeps_standing_when_input_not_ready(monkeypatch, entry_key: str) -> None:
     from teleopit.sim.loop import SimulationLoop
 
     class _RealtimeInputProvider:
@@ -914,7 +999,7 @@ def test_simulation_loop_realtime_keyboard_mode_keeps_standing_when_input_not_re
         def __init__(self) -> None:
             self._polls = [
                 (),
-                (TerminalKeyEvent("y"),),
+                (TerminalKeyEvent(entry_key),),
             ]
             self._idx = 0
 

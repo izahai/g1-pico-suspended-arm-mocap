@@ -25,8 +25,9 @@ The equivalent manual configuration requires `recording.enabled=true`,
 `input.video.source=realsense`.
 
 Use `R` to start an episode, `S` to save it, `D` to discard it, and `Q` to shut
-down. `STANDING`, `MOCAP`, `ARMS`, and paused mocap are recordable. Recording
-does not start without a fresh camera frame. If the camera stays stale for one
+down. `STANDING`, `MOCAP`, `ARMS`, and paused mocap are recordable.
+`SUSPENDED_ARMS` is not recordable; entering it discards an active episode.
+Recording does not start without a fresh camera frame. If the camera stays stale for one
 second during an episode, that episode is discarded; Pico input and G1 control
 continue, and recording does not restart automatically when video recovers.
 

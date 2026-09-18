@@ -37,6 +37,7 @@ class SimulationMode(Enum):
     STANDING = "standing"
     MOCAP = "mocap"
     ARMS = "arms"
+    SUSPENDED_ARMS = "suspended_arms"
 
 
 @final

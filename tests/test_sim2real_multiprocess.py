@@ -14,7 +14,7 @@ import pytest
 
 from teleopit.runtime.mocap_session import MocapSessionState
 from teleopit.inputs.realtime_packet import ControlEvent, ControlEventType
-from teleopit.runtime.arm_mocap import compose_arm_reference, compose_arm_reference_window
+from teleopit.runtime.arm_mocap import compose_arm_reference, compose_arm_reference_window, hold_non_arm_joints
 from teleopit.recording.hdf5 import (
     ACTION_KEY,
     FRAME_INDEX_KEY,
@@ -1155,6 +1155,87 @@ def test_robot_worker_checks_pico_reference_arm_while_entry_is_pending() -> None
     assert arm_checks == ["arm"]
 
 
+def test_laptop_f_requests_suspended_arms_without_recording() -> None:
+    runtime = object.__new__(Sim2RealRuntime)
+    runtime.cfg = {"input": {"provider": "pico4"}, "recording": {"enabled": False}}
+    runtime._keyboard = SimpleNamespace(poll=lambda: (SimpleNamespace(key="f"),))
+    commands: list[object] = []
+    runtime._command_pub = SimpleNamespace(publish=lambda _topic, packet: commands.append(packet))
+    runtime._console = SimpleNamespace(key_feedback=lambda *_args: None)
+
+    runtime._poll_terminal_controls()
+
+    assert len(commands) == 1
+    assert commands[0].command == "toggle_suspended_arms"
+
+
+def test_suspended_arms_entry_waits_for_valid_pico_frames_and_times_out(monkeypatch) -> None:
+    now_s = [100.0]
+    monkeypatch.setattr("teleopit.sim2real.mp.runtime.time.monotonic", lambda: now_s[0])
+    worker = object.__new__(_RobotControlWorker)
+    worker.provider_kind = "pico4"
+    worker.high_level_policy_enabled = False
+    worker.mode = RobotMode.STANDING
+    worker._mocap_entry_requested = False
+    worker._mocap_reentry_armed = False
+    worker._suspended_entry_requested = False
+    worker.remote = SimpleNamespace(Y=SimpleNamespace(on_pressed=False, pressed=False))
+    armed: list[str] = []
+    cancelled: list[str] = []
+    worker._arm_mocap_reference_if_needed = lambda: armed.append("arm")
+    worker._disarm_mocap_reference_if_needed = lambda: cancelled.append("disarm")
+    worker._clear_reference_gate = lambda: cancelled.append("clear")
+    ready = [False]
+    worker._can_switch_to_mocap = lambda: ready[0]
+    worker._transition_to_suspended_arms = lambda: setattr(worker, "mode", RobotMode.SUSPENDED_ARMS)
+
+    worker._toggle_suspended_arms_mode()
+    worker._handle_transitions()
+    assert worker.mode == RobotMode.STANDING
+    assert worker._suspended_entry_requested is True
+    now_s[0] = 101.0
+    ready[0] = True
+    worker._handle_transitions()
+    assert worker.mode == RobotMode.SUSPENDED_ARMS
+
+    worker.mode = RobotMode.STANDING
+    worker._suspended_entry_requested = False
+    ready[0] = False
+    worker._toggle_suspended_arms_mode()
+    now_s[0] = 103.1
+    worker._handle_transitions()
+    assert worker.mode == RobotMode.STANDING
+    assert worker._suspended_entry_requested is False
+    assert cancelled == ["disarm", "clear"]
+
+
+def test_suspended_arms_entry_captures_measured_joint_positions() -> None:
+    worker = object.__new__(_RobotControlWorker)
+    worker.mode = RobotMode.STANDING
+    worker.num_actions = 29
+    worker._arm_joint_indices = np.arange(15, 29, dtype=np.int64)
+    measured = np.linspace(-0.2, 0.2, 29, dtype=np.float32)
+    state = SimpleNamespace(qpos=measured)
+    worker.robot = SimpleNamespace(get_state=lambda: state)
+    worker._safety = SimpleNamespace(clip_to_joint_limits=lambda target: target)
+    transitions: list[RobotMode] = []
+    def transition(*, entry_mode: RobotMode, entry_state: object) -> None:
+        assert entry_state is state
+        transitions.append(entry_mode)
+        worker.mode = entry_mode
+
+    worker._transition_to_mocap = transition
+    worker._set_default_standing_reference = lambda _state: None
+    worker._suspended_entry_requested = True
+
+    worker._transition_to_suspended_arms()
+
+    assert transitions == [RobotMode.SUSPENDED_ARMS]
+    assert worker.mode == RobotMode.SUSPENDED_ARMS
+    assert worker._suspended_entry_requested is False
+    np.testing.assert_array_equal(worker._suspended_hold_joint_pos, measured)
+
+
 def test_robot_worker_disarms_pico_reference_and_clears_gate() -> None:
     worker = object.__new__(_RobotControlWorker)
     commands: list[str] = []
@@ -1328,6 +1409,23 @@ def test_robot_worker_composes_arm_reference_window_samples() -> None:
     np.testing.assert_allclose(composed.samples[1].qpos[:7 + 15], 0.0)
 
 
+def test_suspended_arms_keeps_captured_non_arm_targets_and_applies_arm_policy() -> None:
+    action = np.full(29, 0.4, dtype=np.float32)
+    policy_targets = np.full(29, 1.2, dtype=np.float32)
+    captured = np.linspace(-0.3, 0.3, 29, dtype=np.float32)
+
+    applied_action, targets = hold_non_arm_joints(
+        action, policy_targets, captured, np.arange(15, 29, dtype=np.int64),
+    )
+
+    np.testing.assert_array_equal(applied_action[:15], 0.0)
+    np.testing.assert_array_equal(applied_action[15:], action[15:])
+    np.testing.assert_array_equal(targets[:15], captured[:15])
+    np.testing.assert_array_equal(targets[15:], policy_targets[15:])
+    np.testing.assert_array_equal(action, np.full(29, 0.4, dtype=np.float32))
+    np.testing.assert_array_equal(policy_targets, np.full(29, 1.2, dtype=np.float32))
+
+
 def test_robot_worker_pico_arms_event_toggles_mocap_and_arms() -> None:
     worker = object.__new__(_RobotControlWorker)
     worker.provider_kind = "pico4"
@@ -1352,8 +1450,13 @@ def test_robot_worker_pico_arms_event_toggles_mocap_and_arms() -> None:
 
     worker._handle_mocap_control_events((event,))
     assert worker.mode == RobotMode.MOCAP
-    assert len(resets) == 2
-    assert ramps == ["ramp", "ramp"]
+    worker.mode = RobotMode.SUSPENDED_ARMS
+    worker._suspended_hold_joint_pos = np.zeros(29, dtype=np.float32)
+    worker._handle_mocap_control_events((event,))
+    assert worker.mode == RobotMode.ARMS
+    assert worker._suspended_hold_joint_pos is None
+    assert len(resets) == 3
+    assert ramps == ["ramp", "ramp", "ramp"]
 
 
 def test_robot_worker_bvh_ignores_pico_arms_event() -> None:
@@ -1458,6 +1561,112 @@ def test_robot_worker_publish_record_step() -> None:
     assert packet.observation_mode == int(build_mode_observation("arms"))
     assert packet.action_reference_qpos.shape == (36,)
     np.testing.assert_allclose(packet.action_reference_qpos, reference_qpos.astype(np.float32))
+
+
+def test_suspended_arms_record_packet_is_not_recordable() -> None:
+    worker = object.__new__(_RobotControlWorker)
+    worker.mode = RobotMode.SUSPENDED_ARMS
+    worker._mocap_session = SimpleNamespace(state=MocapSessionState.ACTIVE)
+    worker._mode_seq = 1
+    published: list[object] = []
+    worker._record_pub = SimpleNamespace(publish=lambda _topic, packet: published.append(packet))
+    state = SimpleNamespace(
+        qpos=np.zeros(29, dtype=np.float32),
+        qvel=np.zeros(29, dtype=np.float32),
+        quat=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        ang_vel=np.zeros(3, dtype=np.float32),
+    )
+
+    worker._publish_record_step(robot_state=state, reference_qpos=np.zeros(36, dtype=np.float64))
+
+    packet = published[0]
+    assert packet.mode == "suspended_arms"
+    assert packet.recordable is False
+    assert packet.observation_mode == -1
+
+
+def test_suspended_arms_stale_reference_holds_non_arm_motor_targets() -> None:
+    worker = object.__new__(_RobotControlWorker)
+    worker.mode = RobotMode.SUSPENDED_ARMS
+    worker.num_actions = 29
+    worker.policy_hz = 50.0
+    worker._arm_joint_indices = np.arange(15, 29, dtype=np.int64)
+    worker._suspended_hold_joint_pos = np.linspace(-0.3, 0.3, 29, dtype=np.float32)
+    worker._last_action = np.zeros(29, dtype=np.float32)
+    worker.obs_builder = SimpleNamespace()
+    worker.robot = SimpleNamespace(get_state=lambda: SimpleNamespace())
+    worker._ref_proc = SimpleNamespace(
+        build_observation=lambda **_kwargs: np.zeros(1, dtype=np.float32),
+        validate_observation=lambda obs: obs,
+        last_reference_qpos=None,
+    )
+    worker.policy = SimpleNamespace(
+        compute_action=lambda _obs: np.full(29, 0.4, dtype=np.float32),
+        get_target_dof_pos=lambda _action: np.full(29, 1.2, dtype=np.float32),
+    )
+    sent: list[np.ndarray] = []
+    worker._safety = SimpleNamespace(
+        clip_to_joint_limits=lambda targets: targets,
+        send_positions=lambda targets: sent.append(np.asarray(targets).copy()),
+    )
+    worker._publish_record_step = lambda **_kwargs: None
+    worker._write_retarget_viewer = lambda _qpos: None
+
+    worker._run_static_mocap_step(np.zeros(36, dtype=np.float64))
+
+    np.testing.assert_array_equal(sent[0][:15], worker._suspended_hold_joint_pos[:15])
+    np.testing.assert_array_equal(sent[0][15:], np.full(14, 1.2, dtype=np.float32))
+    np.testing.assert_array_equal(worker._last_action[:15], np.zeros(15, dtype=np.float32))
+
+
+def test_suspended_arms_live_reference_tracks_arms_and_holds_non_arm_motors() -> None:
+    worker = object.__new__(_RobotControlWorker)
+    worker.mode = RobotMode.SUSPENDED_ARMS
+    worker.num_actions = 29
+    worker.policy_hz = 50.0
+    worker._arm_joint_indices = np.arange(15, 29, dtype=np.int64)
+    worker._suspended_hold_joint_pos = np.linspace(-0.3, 0.3, 29, dtype=np.float32)
+    worker._standing_qpos = np.zeros(36, dtype=np.float64)
+    worker._standing_qpos[3] = 1.0
+    worker._last_action = np.zeros(29, dtype=np.float32)
+    worker._last_retarget_qpos = None
+    worker.obs_builder = SimpleNamespace()
+    seen_reference: list[np.ndarray] = []
+    worker._ref_proc = SimpleNamespace(
+        align_reference_window=lambda window, _state: window,
+        apply_joint_vel_smoothing=lambda vel: vel,
+        compute_anchor_velocities=lambda _qpos: (np.zeros(3), np.zeros(3)),
+        apply_anchor_vel_smoothing=lambda lin, ang: (lin, ang),
+        build_observation=lambda **kwargs: (
+            seen_reference.append(np.asarray(kwargs["motion_qpos"]).copy())
+            or np.zeros(1, dtype=np.float32)
+        ),
+        validate_observation=lambda obs: obs,
+        last_reference_qpos=None,
+    )
+    worker.policy = SimpleNamespace(
+        compute_action=lambda _obs: np.full(29, 0.4, dtype=np.float32),
+        get_target_dof_pos=lambda _action: np.full(29, 1.2, dtype=np.float32),
+    )
+    sent: list[np.ndarray] = []
+    worker._safety = SimpleNamespace(
+        clip_to_joint_limits=lambda targets: targets,
+        send_positions=lambda targets: sent.append(np.asarray(targets).copy()),
+    )
+    worker._publish_record_step = lambda **_kwargs: None
+    worker._write_retarget_viewer = lambda _qpos: None
+    live_qpos = np.full(36, 2.0, dtype=np.float64)
+    live_qpos[3] = 1.0
+
+    worker._execute_reference_pipeline(
+        live_qpos, SimpleNamespace(), reference_window=None,
+        align_reference=False, compose_arms=True,
+    )
+
+    np.testing.assert_array_equal(seen_reference[0][7:22], np.zeros(15, dtype=np.float32))
+    np.testing.assert_array_equal(seen_reference[0][22:36], np.full(14, 2.0, dtype=np.float32))
+    np.testing.assert_array_equal(sent[0][:15], worker._suspended_hold_joint_pos[:15])
+    np.testing.assert_array_equal(sent[0][15:], np.full(14, 1.2, dtype=np.float32))
 
 
 def test_robot_worker_enter_damping_publishes_non_recordable_packet() -> None:

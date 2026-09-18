@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -8,6 +9,9 @@ from numpy.typing import NDArray
 from teleopit.constants import ROOT_DIM
 from teleopit.runtime.common import cfg_get
 from teleopit.sim.reference_timeline import ReferenceSample, ReferenceWindow
+
+if TYPE_CHECKING:
+    from teleopit.sim.reference_timeline import ReferenceSample, ReferenceWindow
 
 
 Float64Array = NDArray[np.float64]
@@ -53,6 +57,7 @@ def compose_arm_reference_window(
 ) -> ReferenceWindow | None:
     if reference_window is None:
         return None
+    from teleopit.sim.reference_timeline import ReferenceSample, ReferenceWindow
     samples = tuple(
         ReferenceSample(
             qpos=compose_arm_reference(
@@ -76,3 +81,24 @@ def compose_arm_reference_window(
         reference_steps=tuple(reference_window.reference_steps),
         samples=samples,
     )
+
+
+def hold_non_arm_joints(
+    action: NDArray[np.float32],
+    target_dof_pos: NDArray[np.float32],
+    held_joint_pos: NDArray[np.float32],
+    arm_joint_indices: NDArray[np.int64],
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Keep policy arm targets and hold every other joint at its captured position."""
+    applied_action = np.asarray(action, dtype=np.float32).reshape(-1).copy()
+    applied_target = np.asarray(target_dof_pos, dtype=np.float32).reshape(-1).copy()
+    held = np.asarray(held_joint_pos, dtype=np.float32).reshape(-1)
+    if applied_action.shape != applied_target.shape or applied_target.shape != held.shape:
+        raise ValueError(
+            "Suspended arm action, target, and held joint positions must have the same shape"
+        )
+    non_arm_mask = np.ones(applied_action.shape[0], dtype=bool)
+    non_arm_mask[np.asarray(arm_joint_indices, dtype=np.int64)] = False
+    applied_action[non_arm_mask] = 0.0
+    applied_target[non_arm_mask] = held[non_arm_mask]
+    return applied_action, applied_target

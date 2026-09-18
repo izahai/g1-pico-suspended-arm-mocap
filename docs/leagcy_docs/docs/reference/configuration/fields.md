@@ -103,7 +103,7 @@ and `all` are simulation-only viewer modes.
 | `startup_ramp_duration` | Kp ramp duration after entering `STANDING`; gradually increases PD gains without changing policy targets | `2.0` |
 | `joint_vel_limit` | Joint velocity limit (rad/s); triggers emergency damping if exceeded | `10.0` |
 | `mocap_switch.check_frames` | Consecutive valid frames required before switching to MOCAP | `10` |
-| `arm_mocap.controlled_joint_indices` | G1 joints driven by live retargeting in Pico `ARMS` mode | `[15..28]` |
+| `arm_mocap.controlled_joint_indices` | G1 joints driven by live retargeting in Pico `ARMS` and `SUSPENDED_ARMS` modes; only these joints receive policy targets in `SUSPENDED_ARMS` | `[15..28]` |
 
 ### Host High-Level Policy (independent sim2real)
 
@@ -243,7 +243,7 @@ are rejected rather than ignored.
 | `neck.port` | Optional serial port override, for example `/dev/ttyACM0` | `null` |
 | `neck.rate_hz` | Maximum neck command rate in Hz | `60.0` |
 | `neck.frame_timeout_s` | Pico HMD/Spine3 pose staleness threshold | `0.2` |
-| `neck.active_modes` | Sim2real modes that allow neck motion | `[standing, mocap, arms, pause]` |
+| `neck.active_modes` | Sim2real modes that allow neck motion | `[standing, mocap, arms, suspended_arms, pause]` |
 | `neck.dead_zone_deg` | Yaw/pitch dead zone in degrees | `0.5` |
 | `neck.pitch_gain` | Gain applied to relative HMD pitch after the dead zone | `1.4` |
 | `neck.center_on_start` / `center_on_shutdown` | Center the gimbal at worker startup/shutdown | `true` / `false` |
