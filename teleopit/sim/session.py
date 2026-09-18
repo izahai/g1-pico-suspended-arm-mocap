@@ -192,6 +192,7 @@ class SimLoopSession:
             SimulationMode.STANDING if self.realtime_keyboard_mode_enabled else SimulationMode.MOCAP
         )
         self._suspended_hold_joint_pos: Float32Array | None = None
+        self._suspended_entry_from_idle: bool = False
         if self.simulation_mode == SimulationMode.STANDING:
             loop._set_standing_reference(loop.robot.get_state())
 
@@ -241,11 +242,19 @@ class SimLoopSession:
         self.last_commanded_motion_qpos = None
         self.reset_runtime_tracking()
 
+    def enter_idle_mode(self) -> None:
+        from teleopit.sim.loop import SimulationMode
+        self.reset_policy_reference_state()
+        self._suspended_hold_joint_pos = None
+        self._suspended_entry_from_idle = False
+        self.simulation_mode = SimulationMode.IDLE
+
     def enter_standing_mode(self) -> None:
         from teleopit.sim.loop import SimulationMode
         self.reset_policy_reference_state()
         self._loop._set_standing_reference(self._loop.robot.get_state())
         self._suspended_hold_joint_pos = None
+        self._suspended_entry_from_idle = False
         self.simulation_mode = SimulationMode.STANDING
 
     def enter_mocap_mode(self) -> bool:
@@ -276,10 +285,12 @@ class SimLoopSession:
         if not np.isfinite(frame_age_s) or frame_age_s < -0.05 or frame_age_s > 0.25:
             _logger.warning("Cannot enter SUSPENDED_ARMS: Pico frame is not fresh (age %.3fs)", frame_age_s)
             return False
+        from_idle = self.simulation_mode == SimulationMode.IDLE
         if not self.enter_mocap_mode():
             return False
         state = loop.robot.get_state()
         self._suspended_hold_joint_pos = np.asarray(state.qpos, dtype=np.float32)[: loop._num_actions].copy()
+        self._suspended_entry_from_idle = from_idle
         loop._set_standing_reference(state)
         self.simulation_mode = SimulationMode.SUSPENDED_ARMS
         return True
@@ -351,9 +362,12 @@ class SimLoopSession:
                 self.playback_stop_requested = True
                 self._loop._console.key_feedback("Q", "quit", result="stopping")
                 return True
-            if self.simulation_mode == SimulationMode.STANDING:
+            if self.simulation_mode in (SimulationMode.STANDING, SimulationMode.IDLE):
                 if key == "y":
-                    if self.enter_mocap_mode():
+                    if self.simulation_mode == SimulationMode.IDLE:
+                        self.enter_standing_mode()
+                        self._loop._console.key_feedback("Y", "standing", result="STANDING")
+                    elif self.enter_mocap_mode():
                         self._loop._console.key_feedback("Y", "mocap", result="MOCAP")
                     else:
                         self._loop._console.key_feedback("Y", "mocap", result="waiting for input")
@@ -364,12 +378,20 @@ class SimLoopSession:
                         self._loop._console.key_feedback("F", "suspended arms", result="tracking not ready; press F again")
                 continue
             if key == "f" and self.simulation_mode == SimulationMode.SUSPENDED_ARMS:
-                self.enter_standing_mode()
-                self._loop._console.key_feedback("F", "standing", result="STANDING")
+                if getattr(self, "_suspended_entry_from_idle", False):
+                    self.enter_idle_mode()
+                    self._loop._console.key_feedback("F", "idle", result="IDLE")
+                else:
+                    self.enter_standing_mode()
+                    self._loop._console.key_feedback("F", "standing", result="STANDING")
                 continue
             if key == "x":
-                self.enter_standing_mode()
-                self._loop._console.key_feedback("X", "standing", result="STANDING")
+                if self.simulation_mode == SimulationMode.SUSPENDED_ARMS and getattr(self, "_suspended_entry_from_idle", False):
+                    self.enter_idle_mode()
+                    self._loop._console.key_feedback("X", "idle", result="IDLE")
+                else:
+                    self.enter_standing_mode()
+                    self._loop._console.key_feedback("X", "standing", result="STANDING")
                 continue
             if key == "b":
                 if self.toggle_arms_mode():

@@ -1236,6 +1236,96 @@ def test_suspended_arms_entry_captures_measured_joint_positions() -> None:
     np.testing.assert_array_equal(worker._suspended_hold_joint_pos, measured)
 
 
+def test_suspended_arms_direct_entry_from_idle(monkeypatch) -> None:
+    now_s = [100.0]
+    monkeypatch.setattr("teleopit.sim2real.mp.runtime.time.monotonic", lambda: now_s[0])
+    worker = object.__new__(_RobotControlWorker)
+    worker.provider_kind = "pico4"
+    worker.high_level_policy_enabled = False
+    worker.mode = RobotMode.IDLE
+    worker._mocap_entry_requested = False
+    worker._suspended_entry_requested = False
+    worker._suspended_entry_from_idle = False
+    worker.num_actions = 29
+    worker._arm_joint_indices = np.arange(15, 29, dtype=np.int64)
+    worker.remote = SimpleNamespace(
+        start=SimpleNamespace(on_pressed=False),
+        X=SimpleNamespace(on_pressed=False),
+    )
+    worker._arm_mocap_reference_if_needed = lambda: None
+    ready = [False]
+    worker._can_switch_to_mocap = lambda: ready[0]
+
+    debug_events: list[str] = []
+    measured = np.linspace(-0.1, 0.1, 29, dtype=np.float32)
+    state = SimpleNamespace(qpos=measured)
+    worker.robot = SimpleNamespace(
+        enter_debug_mode=lambda: debug_events.append("enter_debug") or True,
+        lock_all_joints=lambda: debug_events.append("lock_joints"),
+        get_state=lambda: state,
+    )
+    worker._safety = SimpleNamespace(
+        clip_to_joint_limits=lambda target: target,
+        start_kp_ramp=lambda: debug_events.append("kp_ramp"),
+    )
+    worker._build_robot_state_qpos = lambda _s: np.zeros(36, dtype=np.float64)
+    worker._ref_proc = SimpleNamespace(last_reference_qpos=None)
+    worker._mocap_session = SimpleNamespace(reset=lambda: None)
+    worker._transition_to_mocap = lambda **kwargs: setattr(worker, "mode", RobotMode.SUSPENDED_ARMS)
+    worker._set_default_standing_reference = lambda _s: None
+
+    # 1. Trigger F from IDLE
+    worker._toggle_suspended_arms_mode()
+    assert worker.mode == RobotMode.IDLE
+    assert worker._suspended_entry_requested is True
+    assert worker._suspended_entry_from_idle is True
+
+    # 2. Tracking becomes ready -> transitions to SUSPENDED_ARMS
+    ready[0] = True
+    worker._handle_transitions()
+    assert worker.mode == RobotMode.SUSPENDED_ARMS
+    assert worker._suspended_entry_requested is False
+    assert "enter_debug" in debug_events
+    assert "lock_joints" in debug_events
+    assert "kp_ramp" in debug_events
+    np.testing.assert_array_equal(worker._suspended_hold_joint_pos, measured)
+
+    # 3. Exit via F returns to IDLE without standing
+    exited_debug = []
+    worker.robot.exit_debug_mode = lambda: exited_debug.append("exit_debug")
+    standing_called = []
+    worker._enter_standing = lambda: standing_called.append("standing")
+    worker._disarm_mocap_reference_if_needed = lambda: None
+    worker._clear_reference_gate = lambda: None
+
+    worker._toggle_suspended_arms_mode()
+    assert worker.mode == RobotMode.IDLE
+    assert exited_debug == ["exit_debug"]
+    assert standing_called == []
+    assert worker._suspended_entry_from_idle is False
+
+
+def test_suspended_arms_remote_x_returns_to_idle_when_entered_from_idle() -> None:
+    worker = object.__new__(_RobotControlWorker)
+    worker.mode = RobotMode.SUSPENDED_ARMS
+    worker.high_level_policy_enabled = False
+    worker.provider_kind = "pico4"
+    worker._suspended_entry_from_idle = True
+    worker.remote = SimpleNamespace(
+        X=SimpleNamespace(on_pressed=True),
+        B=SimpleNamespace(on_pressed=False),
+        A=SimpleNamespace(on_pressed=False),
+    )
+    exited: list[str] = []
+    worker._enter_idle = lambda: exited.append("idle") or setattr(worker, "mode", RobotMode.IDLE)
+    worker._enter_standing = lambda: exited.append("standing") or setattr(worker, "mode", RobotMode.STANDING)
+
+    worker._handle_transitions()
+    assert worker.mode == RobotMode.IDLE
+    assert exited == ["idle"]
+
+
+
 def test_robot_worker_disarms_pico_reference_and_clears_gate() -> None:
     worker = object.__new__(_RobotControlWorker)
     commands: list[str] = []

@@ -1285,6 +1285,7 @@ class _RobotControlWorker:
         self._mocap_entry_requested = False
         self._suspended_entry_requested = False
         self._suspended_entry_deadline_s: float | None = None
+        self._suspended_entry_from_idle = False
         self._suspended_hold_joint_pos: Float32Array | None = None
         self._mocap_reference_armed = False
         self._mocap_reference_arm_time_s: float | None = None
@@ -1533,6 +1534,22 @@ class _RobotControlWorker:
             self._handle_high_level_policy_transitions()
             return
         if self.mode == RobotMode.IDLE:
+            if (
+                getattr(self, "_suspended_entry_requested", False)
+                and bool(getattr(getattr(self.remote, "X", None), "on_pressed", False))
+            ):
+                self._cancel_suspended_entry()
+                operator_logger.info("X -> suspended arms entry cancelled; remaining in IDLE")
+                return
+            if getattr(self, "_suspended_entry_requested", False):
+                self._arm_mocap_reference_if_needed()
+                if self._can_switch_to_mocap():
+                    self._transition_to_suspended_arms()
+                    return
+                deadline_s = self._suspended_entry_deadline_s
+                if deadline_s is not None and time.monotonic() >= deadline_s:
+                    self._cancel_suspended_entry()
+                    operator_logger.warning("F -> Pico tracking not ready; remaining in IDLE")
             if self.remote.start.on_pressed:
                 operator_logger.info("Start -> STANDING")
                 self._enter_standing()
@@ -1604,8 +1621,12 @@ class _RobotControlWorker:
                     self._pause_active_mocap()
                 return
             if self.remote.X.on_pressed:
-                operator_logger.info("X -> STANDING")
-                self._enter_standing()
+                if self.mode == RobotMode.SUSPENDED_ARMS and getattr(self, "_suspended_entry_from_idle", False):
+                    operator_logger.info("X -> IDLE")
+                    self._enter_idle()
+                else:
+                    operator_logger.info("X -> STANDING")
+                    self._enter_standing()
         elif self.mode == RobotMode.DAMPING:
             if self.remote.start.on_pressed:
                 operator_logger.info("Start -> STANDING")
@@ -2432,6 +2453,7 @@ class _RobotControlWorker:
         self._suspended_entry_requested = False
         self._suspended_entry_deadline_s = None
         self._suspended_hold_joint_pos = None
+        self._suspended_entry_from_idle = False
         if prev_mode == RobotMode.STANDING:
             return
         already_in_debug = self.mode in (
@@ -2534,10 +2556,16 @@ class _RobotControlWorker:
         if self.provider_kind != "pico4" or self.high_level_policy_enabled:
             return
         if self.mode == RobotMode.SUSPENDED_ARMS:
-            self._enter_standing()
+            if getattr(self, "_suspended_entry_from_idle", False):
+                self._enter_idle()
+            else:
+                self._enter_standing()
             return
-        if self.mode != RobotMode.STANDING:
-            operator_logger.info("F ignored in %s; enter SUSPENDED_ARMS from STANDING", self.mode.value.upper())
+        if self.mode not in (RobotMode.STANDING, RobotMode.IDLE):
+            operator_logger.info(
+                "F ignored in %s; enter SUSPENDED_ARMS from STANDING or IDLE",
+                self.mode.value.upper(),
+            )
             return
         if getattr(self, "_pending_after_settle", None) is not None:
             operator_logger.info("F ignored while waiting for joystick transition to settle")
@@ -2548,18 +2576,53 @@ class _RobotControlWorker:
             return
         self._mocap_entry_requested = False
         self._suspended_entry_requested = True
+        self._suspended_entry_from_idle = (self.mode == RobotMode.IDLE)
         self._suspended_entry_deadline_s = time.monotonic() + 2.0
         self._arm_mocap_reference_if_needed()
-        operator_logger.info("F -> validating Pico tracking for SUSPENDED_ARMS")
+        operator_logger.info(
+            "F -> validating Pico tracking for SUSPENDED_ARMS (%s origin)",
+            "IDLE" if self._suspended_entry_from_idle else "STANDING",
+        )
 
     def _cancel_suspended_entry(self) -> None:
         self._suspended_entry_requested = False
         self._suspended_entry_deadline_s = None
+        self._suspended_entry_from_idle = False
         if not self._mocap_entry_requested:
             self._disarm_mocap_reference_if_needed()
             self._clear_reference_gate()
 
+    def _enter_idle(self) -> None:
+        self._disarm_mocap_reference_if_needed()
+        self._clear_reference_gate()
+        self._mocap_entry_requested = False
+        self._suspended_entry_requested = False
+        self._suspended_entry_deadline_s = None
+        self._suspended_hold_joint_pos = None
+        self._suspended_entry_from_idle = False
+        logger.info("Exiting debug mode (returning to IDLE)...")
+        self.robot.exit_debug_mode()
+        self.mode = RobotMode.IDLE
+        self._ref_proc.last_reference_qpos = None
+        self._last_retarget_qpos = None
+        self._last_commanded_motion_qpos = None
+        self._mocap_session.reset()
+        operator_logger.info("mode -> IDLE")
+
     def _transition_to_suspended_arms(self) -> None:
+        from_idle = self.mode == RobotMode.IDLE
+        if from_idle:
+            logger.info("Entering debug mode (suspended arms from IDLE)...")
+            ok = self.robot.enter_debug_mode()
+            if not ok:
+                logger.error("Failed to enter debug mode -- staying in IDLE")
+                self._cancel_suspended_entry()
+                return
+            time.sleep(0.5)
+            logger.info("Locking joints to current hanging position...")
+            self.robot.lock_all_joints()
+            time.sleep(0.3)
+
         state = self.robot.get_state()
         held = np.asarray(getattr(state, "qpos"), dtype=np.float32).reshape(-1)
         if held.shape[0] < self.num_actions:
@@ -2571,11 +2634,23 @@ class _RobotControlWorker:
         safe_held = self._safety.clip_to_joint_limits(held[: self.num_actions])
         if np.any(np.abs(safe_held[non_arm_mask] - held[: self.num_actions][non_arm_mask]) > 1e-4):
             self._cancel_suspended_entry()
-            operator_logger.warning("F -> non-arm joint outside configured limits; remaining in STANDING")
+            if from_idle:
+                self.robot.exit_debug_mode()
+                operator_logger.warning("F -> non-arm joint outside configured limits; remaining in IDLE")
+            else:
+                operator_logger.warning("F -> non-arm joint outside configured limits; remaining in STANDING")
             return
         self._suspended_hold_joint_pos = held[: self.num_actions].copy()
+        if from_idle:
+            init_qpos = self._build_robot_state_qpos(state)
+            self._last_retarget_qpos = init_qpos
+            self._ref_proc.last_reference_qpos = None
+            self._mocap_session.reset()
+            self._last_commanded_motion_qpos = None
         self._transition_to_mocap(entry_mode=RobotMode.SUSPENDED_ARMS, entry_state=state)
         self._set_default_standing_reference(state)
+        if from_idle:
+            self._safety.start_kp_ramp()
         self._suspended_entry_requested = False
         self._suspended_entry_deadline_s = None
         operator_logger.info("SUSPENDED_ARMS holds legs and waist at measured entry angles")
@@ -2626,6 +2701,7 @@ class _RobotControlWorker:
         self.robot.exit_debug_mode()
         self.mode = RobotMode.DAMPING
         self._suspended_hold_joint_pos = None
+        self._suspended_entry_from_idle = False
         self._publish_damping_record_step()
         self._ref_proc.last_reference_qpos = None
         self._mocap_reentry_armed = False

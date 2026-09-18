@@ -882,6 +882,54 @@ def test_suspended_arms_holds_non_arm_targets_until_exit(monkeypatch, exit_contr
     assert robot.torques[2][0] != 0.0
 
 
+def test_suspended_arms_sim2sim_direct_entry_from_idle(monkeypatch) -> None:
+    import time
+    from types import SimpleNamespace
+    from teleopit.sim.loop import SimulationLoop, SimulationMode
+    from teleopit.sim.session import SimLoopSession
+
+    class _KeyboardReader:
+        active = True
+        polls = iter(((TerminalKeyEvent("f"),), (TerminalKeyEvent("f"),)))
+        def poll(self):
+            return next(self.polls, ())
+        def close(self):
+            pass
+
+    loop = SimulationLoop(
+        robot=_DummyRobot(),
+        controller=_DummyController(),
+        obs_builder=_DummyObsBuilder(),
+        bus=InProcessBus(),
+        cfg={
+            "policy_hz": 50.0,
+            "pd_hz": 50.0,
+            "realtime": True,
+            "keyboard": {"enabled": True},
+            "arm_mocap": {"controlled_joint_indices": [1]},
+        },
+        viewers=set(),
+    )
+    session = SimLoopSession(loop, input_provider=None, retargeter=None, num_steps=10)
+    session.keyboard_reader = _KeyboardReader()
+    session.simulation_mode = SimulationMode.IDLE
+    session._input_provider = SimpleNamespace()
+    loop._realtime_input_has_frame = lambda _ip: True
+    loop._fetch_realtime_input_packet = lambda _ip, _seq: SimpleNamespace(timestamp_s=time.monotonic())
+    session.enter_mocap_mode = lambda: True
+
+    # 1. First 'f' event: enters SUSPENDED_ARMS from IDLE
+    session._handle_realtime_keyboard()
+    assert session.simulation_mode == SimulationMode.SUSPENDED_ARMS
+    assert session._suspended_entry_from_idle is True
+
+    # 2. Second 'f' event: exits SUSPENDED_ARMS back to IDLE
+    session._handle_realtime_keyboard()
+    assert session.simulation_mode == SimulationMode.IDLE
+    assert session._suspended_entry_from_idle is False
+
+
+
 @requires_mujoco
 def test_simulation_loop_realtime_keyboard_mode_drains_stale_pause_events(monkeypatch) -> None:
     from teleopit.sim.loop import SimulationLoop
